@@ -1,1 +1,23 @@
-
+{
+  "package": {
+    "productName": "Hex AI",
+    "version": "1.0.0"
+  },
+  "tauri": {
+    "allowlist": {
+      "shell": {
+        "execute": true
+      },
+      "fs": {
+        "all": true
+      }
+    },
+    "windows": [
+      {
+        "title": "Hex AI",
+        "width": 900,
+        "height": 600
+      }
+    ]
+  }
+}
