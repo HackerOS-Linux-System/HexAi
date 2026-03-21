@@ -1,4 +1,6 @@
 // python3.13
 // cargo
+// npm
 
 > cargo build --release
+> cd source-code && cd gui && npm install && npm run build
