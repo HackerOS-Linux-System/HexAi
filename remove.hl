@@ -1,1 +1,3 @@
->
+> sudo rm -rf /usr/bin/hexai
+> sudo rm -rf /usr/lib/HackerOS/HexAI
+> sudo rm -rf /usr/lib/HackerOS/HexAI-GUI
