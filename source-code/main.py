@@ -10,7 +10,6 @@ import base64
 from io import BytesIO
 from collections import deque
 from typing import Optional, List, Dict, Any, AsyncGenerator
-from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 import redis.asyncio as redis
@@ -42,7 +41,7 @@ from llama_index.core import VectorStoreIndex, SimpleDirectoryReader, Document
 from llama_index.vector_stores.chroma import ChromaVectorStore
 from llama_index.core import StorageContext
 from llama_index.core.node_parser import SimpleNodeParser
-from faster_whisper import WhisperModel
+import whisper  # openai-whisper
 from diffusers import StableDiffusionPipeline
 import torchaudio
 import soundfile as sf
@@ -516,15 +515,14 @@ class HexAI:
             return "codellama:7b-instruct"
         return "llama2"
 
-    # ------------------------- Główna metoda chat -------------------------
-    async def chat(self, session_id: str, prompt: str, stream: bool = False) -> Any:
-        """Główna metoda generowania odpowiedzi z uwzględnieniem wszystkich warstw."""
+    # ------------------------- Główna metoda chat (rozdzielona) -------------------------
+    async def _chat_nonstream(self, session_id: str, prompt: str) -> str:
+        """Non‑streaming version of chat."""
         # Sanityzacja promptu
         prompt = self.sanitize_prompt(prompt)
 
         # Pobierz historię sesji z Redis
         history = await self.persistent_memory.get_history(session_id)
-        # Konwersja do formatu listy krotek
         history_list = [(h[0], h[1]) for h in history]
 
         # Sprawdź, czy pytanie dotyczy przeszłych rozmów (pamięć długoterminowa)
@@ -532,7 +530,6 @@ class HexAI:
         if recall_trigger:
             past_conversations = await self.recall_past_conversations(prompt)
             if past_conversations:
-                # Dołącz je jako kontekst
                 context = "\n\nPoprzednie rozmowy:\n" + "\n".join(past_conversations)
                 prompt = f"{prompt}\n\n{context}"
 
@@ -550,31 +547,10 @@ class HexAI:
         iteration = 0
         while iteration < self.max_tool_iterations:
             if self.engine == 'transformers':
-                if stream:
-                    # Streaming response
-                    generator = self.generate_response_transformers(current_prompt, history_list, stream=True)
-                    # We need to collect the full response for tool detection and history update
-                    # For streaming, we cannot easily detect tool calls, so we'll assume no tools when streaming
-                    # But we can still handle tool calls by disabling streaming if tools are used
-                    # For simplicity, we'll treat streaming as final
-                    async for chunk in generator:
-                        yield chunk
-                    # We won't process tools in streaming mode
-                    final_response = "".join(await self._collect_stream(generator))
-                    break
-                else:
-                    response = await self.generate_response_transformers(current_prompt, history_list, stream=False)
+                response = await self.generate_response_transformers(current_prompt, history_list, stream=False)
             else:
-                if stream:
-                    generator = self.generate_response_ollama(current_prompt, history_list, stream=True)
-                    async for chunk in generator:
-                        yield chunk
-                    final_response = "".join(await self._collect_stream(generator))
-                    break
-                else:
-                    response = await self.generate_response_ollama(current_prompt, history_list, stream=False)
+                response = await self.generate_response_ollama(current_prompt, history_list, stream=False)
 
-            # Sprawdź wywołania narzędzi
             tool_calls = self.parse_tool_call(response)
             if not tool_calls:
                 # Koniec
@@ -588,38 +564,95 @@ class HexAI:
                 result = await asyncio.to_thread(self.execute_tool, tool_name, args)
                 tool_results.append(f"Narzędzie {tool_name} zwróciło: {result}")
 
-            # Usuń wywołania narzędzi z odpowiedzi
             clean_response = re.sub(r'\{tool:.*?\}', '', response).strip()
             history_list[-1] = (prompt, clean_response)
-
-            # Dodaj wyniki narzędzi jako wiadomość systemową
             tool_summary = "\n".join(tool_results)
             history_list.append(("(tool results)", tool_summary))
-
-            # Przygotuj kontynuację
             current_prompt = f"Kontynuuj, uwzględniając wyniki narzędzi: {tool_summary}"
             iteration += 1
 
         # Zapisz w pamięci trwałej
         if final_response:
             await self.persistent_memory.add_message(session_id, prompt, final_response)
-            # Indeksuj do długoterminowej pamięci
             await self.index_conversation(session_id, prompt, final_response)
-            # Aktualizuj profil użytkownika
             await self.user_profiler.update_profile(session_id, prompt, final_response)
 
-        if stream:
-            # If streaming was used, we already yielded tokens
-            return
-        else:
-            return final_response
+        return final_response
 
-    async def _collect_stream(self, generator):
-        """Helper to collect streamed tokens into a single string."""
-        result = []
-        async for chunk in generator:
-            result.append(chunk)
-        return result
+    async def _chat_stream(self, session_id: str, prompt: str) -> AsyncGenerator[str, None]:
+        """Streaming version of chat."""
+        # Sanityzacja promptu
+        prompt = self.sanitize_prompt(prompt)
+
+        # Pobierz historię sesji z Redis
+        history = await self.persistent_memory.get_history(session_id)
+        history_list = [(h[0], h[1]) for h in history]
+
+        # Sprawdź, czy pytanie dotyczy przeszłych rozmów (pamięć długoterminowa)
+        recall_trigger = re.search(r'(pamiętasz|co ustaliliśmy|co mówiliśmy|przypomnij)', prompt, re.IGNORECASE)
+        if recall_trigger:
+            past_conversations = await self.recall_past_conversations(prompt)
+            if past_conversations:
+                context = "\n\nPoprzednie rozmowy:\n" + "\n".join(past_conversations)
+                prompt = f"{prompt}\n\n{context}"
+
+        # Pobierz fakty o użytkowniku
+        facts = await self.user_profiler.get_facts(session_id)
+        if facts:
+            prompt = f"Fakty o użytkowniku: {', '.join(facts)}\n\n{prompt}"
+
+        # Dodaj nową wiadomość do historii (tymczasowo)
+        history_list.append((prompt, ""))
+
+        # Pętla narzędzi
+        current_prompt = prompt
+        final_response = ""
+        iteration = 0
+        while iteration < self.max_tool_iterations:
+            if self.engine == 'transformers':
+                generator = self.generate_response_transformers(current_prompt, history_list, stream=True)
+            else:
+                generator = self.generate_response_ollama(current_prompt, history_list, stream=True)
+
+            # Zbieramy odpowiedź w całości (do wykrycia narzędzi) i jednocześnie strumieniujemy
+            collected_chunks = []
+            async for chunk in generator:
+                collected_chunks.append(chunk)
+                yield chunk
+            full_response = "".join(collected_chunks)
+
+            tool_calls = self.parse_tool_call(full_response)
+            if not tool_calls:
+                # Koniec
+                history_list[-1] = (prompt, full_response)
+                final_response = full_response
+                break
+
+            # Wykonaj narzędzia
+            tool_results = []
+            for tool_name, args in tool_calls:
+                result = await asyncio.to_thread(self.execute_tool, tool_name, args)
+                tool_results.append(f"Narzędzie {tool_name} zwróciło: {result}")
+
+            clean_response = re.sub(r'\{tool:.*?\}', '', full_response).strip()
+            history_list[-1] = (prompt, clean_response)
+            tool_summary = "\n".join(tool_results)
+            history_list.append(("(tool results)", tool_summary))
+            current_prompt = f"Kontynuuj, uwzględniając wyniki narzędzi: {tool_summary}"
+            iteration += 1
+
+        # Zapisz w pamięci trwałej
+        if final_response:
+            await self.persistent_memory.add_message(session_id, prompt, final_response)
+            await self.index_conversation(session_id, prompt, final_response)
+            await self.user_profiler.update_profile(session_id, prompt, final_response)
+
+    async def chat(self, session_id: str, prompt: str, stream: bool = False) -> Any:
+        """Główna metoda – wywołuje odpowiednią wersję w zależności od stream."""
+        if stream:
+            return self._chat_stream(session_id, prompt)
+        else:
+            return await self._chat_nonstream(session_id, prompt)
 
     # ------------------------- Narzędzia -------------------------
     def get_weather(self, city: str) -> str:
@@ -627,7 +660,6 @@ class HexAI:
 
     def search_web(self, query: str) -> str:
         """Wyszukiwanie web z użyciem Google Search API (Serper) zamiast DuckDuckGo."""
-        # Użyj klucza API Serper (należy ustawić zmienną środowiskową SERPER_API_KEY)
         api_key = os.environ.get("SERPER_API_KEY")
         if api_key:
             url = "https://google.serper.dev/search"
@@ -679,10 +711,8 @@ class HexAI:
             results = self.advanced_rag.hybrid_search(query, k=3)
         else:
             results = self.advanced_rag.search(query, k=3)
-        # Możemy przekazać wyniki do LLM do podsumowania
         context = "\n".join(results)
         prompt = f"Odpowiedz na pytanie na podstawie poniższego kontekstu:\n\n{context}\n\nPytanie: {query}"
-        # Użyj bieżącego silnika do wygenerowania odpowiedzi (bez historii)
         if self.engine == 'transformers':
             response = await self.generate_response_transformers(prompt, [], stream=False)
         else:
@@ -748,7 +778,6 @@ class HexAI:
     # ------------------------- TTS (Text-to-Speech) -------------------------
     async def load_tts_model(self):
         if self.tts_model is None:
-            # Użyj MeloTTS (wymaga instalacji: pip install melo)
             self.tts_model = TTS(language='PL')
             self.speed = 1.0
 
@@ -766,13 +795,12 @@ class HexAI:
     async def load_whisper_model(self):
         if self.whisper_model is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
-            self.whisper_model = WhisperModel("small", device=device, compute_type="float16")
+            self.whisper_model = whisper.load_model("small", device=device)
 
     async def transcribe_audio(self, file_path: str) -> str:
         await self.load_whisper_model()
-        segments, info = self.whisper_model.transcribe(file_path, beam_size=5)
-        transcription = ' '.join([segment.text for segment in segments])
-        return transcription
+        result = await asyncio.to_thread(self.whisper_model.transcribe, file_path)
+        return result["text"]
 
     # ------------------------- Obrazy (Stable Diffusion) -------------------------
     async def load_diffuser_pipe(self):
@@ -805,7 +833,7 @@ class HexAI:
             "vram_used_gb": vram_used,
             "vram_total_gb": vram_total,
             "active_sessions": len(asyncio.run(self.persistent_memory.list_sessions())),
-            "history_len": 0,  # placeholder
+            "history_len": 0,
             "model_loaded": self.model_manager.is_loaded(),
             "model_idle_seconds": self.model_manager.idle_seconds()
         }
