@@ -1,0 +1,53 @@
+{
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devPath": "http://localhost:3000",
+    "distDir": "../out"
+  },
+  "package": {
+    "productName": "HexAi",
+    "version": "1.0.0"
+  },
+  "tauri": {
+    "allowlist": {
+      "all": false,
+      "shell": {
+        "open": true
+      },
+      "http": {
+        "all": true,
+        "request": true,
+        "scope": ["http://localhost:8000/**"]
+      }
+    },
+    "bundle": {
+      "active": true,
+      "identifier": "com.hexai.desktop",
+      "icon": [
+        "icons/32x32.png",
+        "icons/128x128.png",
+        "icons/128x128@2x.png",
+        "icons/icon.icns",
+        "icons/icon.ico"
+      ],
+      "resources": [],
+      "copyright": "",
+      "category": "DeveloperTool",
+      "shortDescription": "HexAi – inteligentny asystent AI",
+      "longDescription": "Desktopowa aplikacja dla asystenta AI HexAi z obsługą czatu, RAG, generowaniem obrazów i transkrypcją audio."
+    },
+    "windows": [
+      {
+        "title": "HexAi",
+        "width": 1200,
+        "height": 800,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src data: https: http:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src http://localhost:8000"
+    }
+  }
+}
