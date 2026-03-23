@@ -1,0 +1,45 @@
+# Core dependencies
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+
+# Memory and vector DB
+redis==5.2.1
+chromadb==0.5.23
+rank-bm25==0.2.2
+sentence-transformers==3.3.1
+
+# Web and document parsing
+beautifulsoup4==4.12.3
+pypdf==5.1.0
+duckduckgo-search==7.1.0
+
+# Docker execution
+docker==7.1.0
+
+# LLM and AI models
+accelerate==1.2.1
+transformers==4.48.0
+torch==2.5.1
+torchaudio==2.5.1
+ollama==0.4.5
+
+# RAG and indexing
+llama-index==0.12.9
+llama-index-vector-stores-chroma==0.3.0
+llama-index-core==0.12.9
+
+# Audio and speech
+faster-whisper==1.0.3
+soundfile==0.12.1
+melo==0.1.2
+
+# Image generation and vision
+diffusers==0.31.0
+Pillow==11.1.0
+
+# Utilities
+rich==13.9.4
+
+# Optional: if using CUDA, uncomment the following line
+# --extra-index-url https://download.pytorch.org/whl/cu121
