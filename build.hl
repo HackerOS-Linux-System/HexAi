@@ -3,9 +3,11 @@
 // npm
 // pip
 // python3.13-venv
+// golang
 
 > python3.13 -m venv venv
 > source venv/bin/activate
 > pip install 
 > cargo build --release
 > cd source-code && cd gui && npm install && npm run build
+> cd .. && cd tui && go get hexai-tui && go build
