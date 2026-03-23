@@ -29,8 +29,9 @@ llama-index>=0.12.9,<0.13.0
 llama-index-vector-stores-chroma>=0.4.0,<0.5.0
 llama-index-core>=0.12.9,<0.13.0
 
-# Audio and speech
-faster-whisper==1.0.3
+# Audio and speech (transcription and TTS)
+# UWAGA: faster-whisper i openai-whisper są pominięte ze względu na brak kompatybilności z Python 3.13.
+# Jeśli potrzebujesz transkrypcji audio, zainstaluj je ręcznie w środowisku Python 3.11 lub 3.12.
 soundfile==0.12.1
 melo>=1.0.1
 
@@ -40,6 +41,3 @@ Pillow==11.1.0
 
 # Utilities
 rich==13.9.4
-
-# Optionally, if using CUDA, uncomment the following line
-# --extra-index-url https://download.pytorch.org/whl/cu121
