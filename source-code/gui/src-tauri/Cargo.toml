@@ -7,18 +7,15 @@ license = "GPL-3.0"
 edition = "2021"
 
 [build-dependencies]
-tauri-build = { version = "2.0.0", features = [] }
+tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2.0.0", features = ["api-all", "system-tray", "window-set-title", "window-set-size", "window-close", "window-start-dragging", "shell-open", "http-all"] }
+tauri = { version = "2", features = [] }                     # no explicit features
+tauri-plugin-shell = "2"
+tauri-plugin-http = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
-
-# Opcjonalnie: jeśli chcesz uruchamiać procesy potomne
-# (np. aby automatycznie startować backend Python)
-# odkomentuj poniższą linię:
-# duct = "0.13"
 
 [profile.release]
 opt-level = 3
