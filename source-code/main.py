@@ -8,9 +8,8 @@ import json
 import time
 import base64
 from io import BytesIO
-from collections import deque
 from typing import Optional, List, Dict, Any, AsyncGenerator
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import redis.asyncio as redis
 import chromadb
@@ -21,7 +20,6 @@ from bs4 import BeautifulSoup
 import pypdf
 from duckduckgo_search import DDGS
 import docker
-from docker.types import DeviceRequest
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Request
 from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
@@ -30,22 +28,14 @@ from pydantic import BaseModel, Field
 from rich.console import Console
 import uvicorn
 
-# Importy modeli
 from accelerate import Accelerator
 from transformers import (
     AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig,
-    pipeline, TextIteratorStreamer
+    TextIteratorStreamer
 )
 import ollama
-from llama_index.core import VectorStoreIndex, SimpleDirectoryReader, Document
-from llama_index.vector_stores.chroma import ChromaVectorStore
-from llama_index.core import StorageContext
+from llama_index.core import Document
 from llama_index.core.node_parser import SimpleNodeParser
-import whisper  # openai-whisper
-from diffusers import StableDiffusionPipeline
-import torchaudio
-import soundfile as sf
-from melo.api import TTS
 
 app = FastAPI(title="HexAi API", version="2.0.0")
 app.add_middleware(
@@ -57,9 +47,10 @@ app.add_middleware(
 )
 console = Console()
 
-# ------------------------- Modele danych Pydantic -------------------------
+# ─────────────────────────── Pydantic Models ───────────────────────────
+
 class ChatRequest(BaseModel):
-    session_id: str | None = None
+    session_id: Optional[str] = None
     message: str
     stream: bool = False
 
@@ -68,10 +59,10 @@ class ChatResponse(BaseModel):
     response: str
 
 class EngineRequest(BaseModel):
-    engine: str  # "transformers" lub "ollama"
+    engine: str
 
 class ModeRequest(BaseModel):
-    mode: str  # "general" lub "programista"
+    mode: str
 
 class RagRequest(BaseModel):
     query: str
@@ -87,23 +78,24 @@ class ImageRequest(BaseModel):
 class StatsResponse(BaseModel):
     engine: str
     mode: str
-    vram_used_gb: float | None
-    vram_total_gb: float | None
+    vram_used_gb: Optional[float]
+    vram_total_gb: Optional[float]
     active_sessions: int
     history_len: int
     model_loaded: bool
     model_idle_seconds: float
 
-# ------------------------- Zarządzanie modelami (TTL) -------------------------
+# ─────────────────────────── Model Manager ───────────────────────────
+
 class ModelManager:
     def __init__(self, idle_timeout: int = 600):
         self.idle_timeout = idle_timeout
         self.model = None
         self.tokenizer = None
-        self.last_used = None
+        self.last_used: Optional[float] = None
         self.loading = False
         self.lock = asyncio.Lock()
-        self._cleanup_task = None
+        self._cleanup_task: Optional[asyncio.Task] = None
 
     async def start(self):
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
@@ -111,7 +103,10 @@ class ModelManager:
     async def stop(self):
         if self._cleanup_task:
             self._cleanup_task.cancel()
-            await self._cleanup_task
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
 
     async def get_model(self):
         async with self.lock:
@@ -149,7 +144,11 @@ class ModelManager:
         while True:
             await asyncio.sleep(60)
             async with self.lock:
-                if self.model is not None and self.last_used and (time.time() - self.last_used) > self.idle_timeout:
+                if (
+                    self.model is not None
+                    and self.last_used is not None
+                    and (time.time() - self.last_used) > self.idle_timeout
+                ):
                     console.print("[bold yellow]Unloading idle model...[/bold yellow]")
                     del self.model
                     del self.tokenizer
@@ -157,133 +156,109 @@ class ModelManager:
                     self.tokenizer = None
                     torch.cuda.empty_cache()
 
-    def is_loaded(self):
+    def is_loaded(self) -> bool:
         return self.model is not None
 
-    def idle_seconds(self):
+    def idle_seconds(self) -> float:
         if self.last_used is None:
-            return 0
+            return 0.0
         return time.time() - self.last_used
 
-# ------------------------- Zaawansowany RAG z chunkingiem, hybrydą i rerankingiem -------------------------
+# ─────────────────────────── Advanced RAG ───────────────────────────
+
 class AdvancedRAG:
-    def __init__(self, chroma_client, collection_name="hexai_docs"):
+    def __init__(self, chroma_client, collection_name: str = "hexai_docs"):
         self.chroma_client = chroma_client
         self.collection = chroma_client.get_or_create_collection(collection_name)
-        self.embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
-        self.bm25_index = None
-        self.bm25_docs = []
-        self.cross_encoder = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
-        self.documents = []  # store raw text for BM25
-        self.metadata = []   # store metadata per doc
+        self.embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
+            model_name="all-MiniLM-L6-v2"
+        )
+        self.bm25_index: Optional[BM25Okapi] = None
+        self.documents: List[str] = []
+        self.metadata: List[Dict] = []
+        self.cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
-    def add_documents(self, texts: List[str], metadata: List[Dict] = None):
-        """Add documents to both Chroma (vector) and BM25 index."""
+    def add_documents(self, texts: List[str], metadata: Optional[List[Dict]] = None):
+        if not texts:
+            return
         if metadata is None:
             metadata = [{}] * len(texts)
-        # Add to Chroma
         ids = [str(uuid.uuid4()) for _ in texts]
         embeddings = self.embedding_fn(texts)
         self.collection.add(
             ids=ids,
             embeddings=embeddings,
             documents=texts,
-            metadatas=metadata
+            metadatas=metadata,
         )
-        # Update BM25
         self.documents.extend(texts)
         self.metadata.extend(metadata)
-        # Rebuild BM25 index if we have enough docs
-        if len(self.documents) > 0:
-            tokenized_docs = [doc.split() for doc in self.documents]
-            self.bm25_index = BM25Okapi(tokenized_docs)
+        tokenized_docs = [doc.split() for doc in self.documents]
+        self.bm25_index = BM25Okapi(tokenized_docs)
 
-    def hybrid_search(self, query: str, k: int = 10, alpha: float = 0.5):
-        """
-        Perform hybrid search: vector + BM25, then rerank.
-        """
-        # Vector search
+    def hybrid_search(self, query: str, k: int = 10, alpha: float = 0.5) -> List[str]:
         query_embedding = self.embedding_fn([query])[0]
         vector_results = self.collection.query(
             query_embeddings=[query_embedding],
-            n_results=k,
-            include=["documents", "metadatas", "distances"]
+            n_results=min(k, max(1, self.collection.count())),
+            include=["documents", "metadatas", "distances"],
         )
-        # BM25 search
-        if self.bm25_index is not None:
-            tokenized_query = query.split()
-            bm25_scores = self.bm25_index.get_scores(tokenized_query)
-            # Get top k BM25 indices
-            top_bm25_indices = sorted(range(len(bm25_scores)), key=lambda i: bm25_scores[i], reverse=True)[:k]
-            bm25_docs = [self.documents[i] for i in top_bm25_indices]
-            bm25_scores_list = [bm25_scores[i] for i in top_bm25_indices]
-        else:
-            bm25_docs = []
-            bm25_scores_list = []
+        combined: List[Dict] = []
+        for i, doc in enumerate(vector_results["documents"][0]):
+            dist = vector_results["distances"][0][i]
+            combined.append({"text": doc, "score": (1 - alpha) * (1 - dist), "source": "vector"})
 
-        # Combine results (simple linear combination)
-        combined = []
-        # Add vector results
-        for i, doc in enumerate(vector_results['documents'][0]):
-            combined.append({
-                'text': doc,
-                'score': (1 - alpha) * (1 - vector_results['distances'][0][i]),  # convert distance to similarity
-                'source': 'vector'
-            })
-        # Add BM25 results
-        for doc, score in zip(bm25_docs, bm25_scores_list):
-            combined.append({
-                'text': doc,
-                'score': alpha * (score / (max(bm25_scores_list) + 1e-6)),
-                'source': 'bm25'
-            })
-        # Sort by combined score
-        combined.sort(key=lambda x: x['score'], reverse=True)
+        if self.bm25_index is not None and self.documents:
+            bm25_scores = self.bm25_index.get_scores(query.split())
+            top_indices = sorted(range(len(bm25_scores)), key=lambda i: bm25_scores[i], reverse=True)[:k]
+            max_score = max((bm25_scores[i] for i in top_indices), default=1e-6)
+            for idx in top_indices:
+                combined.append({
+                    "text": self.documents[idx],
+                    "score": alpha * (bm25_scores[idx] / (max_score + 1e-6)),
+                    "source": "bm25",
+                })
+
+        combined.sort(key=lambda x: x["score"], reverse=True)
         top_k = combined[:k]
+        if not top_k:
+            return []
 
-        # Rerank with cross-encoder
-        pairs = [(query, doc['text']) for doc in top_k]
+        pairs = [(query, doc["text"]) for doc in top_k]
         rerank_scores = self.cross_encoder.predict(pairs)
         for i, score in enumerate(rerank_scores):
-            top_k[i]['rerank_score'] = score
-        # Sort by rerank score
-        top_k.sort(key=lambda x: x['rerank_score'], reverse=True)
-        return [doc['text'] for doc in top_k]
+            top_k[i]["rerank_score"] = float(score)
+        top_k.sort(key=lambda x: x["rerank_score"], reverse=True)
+        return [doc["text"] for doc in top_k]
 
-    def search(self, query: str, k: int = 5):
-        """Simple vector search (for compatibility)."""
+    def search(self, query: str, k: int = 5) -> List[str]:
+        if self.collection.count() == 0:
+            return []
         query_embedding = self.embedding_fn([query])[0]
         results = self.collection.query(
             query_embeddings=[query_embedding],
-            n_results=k,
-            include=["documents"]
+            n_results=min(k, self.collection.count()),
+            include=["documents"],
         )
-        return results['documents'][0]
+        return results["documents"][0]
 
-# ------------------------- Bezpieczne wykonywanie kodu (Docker) -------------------------
+# ─────────────────────────── Docker Executor ───────────────────────────
+
 class DockerExecutor:
-    def __init__(self, image: str = "python:3.10-slim", timeout: int = 5):
-        self.docker_client = docker.from_env()
+    def __init__(self, image: str = "python:3.11-slim", timeout: int = 10):
         self.image = image
         self.timeout = timeout
+        try:
+            self.docker_client = docker.from_env()
+        except Exception:
+            self.docker_client = None
 
     async def run_code(self, code: str) -> str:
-        """Execute Python code in a temporary container with resource limits."""
+        if self.docker_client is None:
+            return "Docker nie jest dostępny."
         try:
-            # Create a temporary script
-            script = f"""
-import sys
-import io
-sys.stdout = io.StringIO()
-sys.stderr = io.StringIO()
-try:
-    {code}
-    print(sys.stdout.getvalue())
-except Exception as e:
-    print(f"Error: {{e}}", file=sys.stderr)
-    print(sys.stderr.getvalue())
-            """
-            # Run container
+            safe_code = code.replace('"""', '\\"\\"\\"')
+            script = f'exec("""{safe_code}""")'
             container = self.docker_client.containers.run(
                 self.image,
                 command=["python", "-c", script],
@@ -292,286 +267,345 @@ except Exception as e:
                 memswap_limit="256m",
                 cpu_period=100000,
                 cpu_quota=50000,
-                network_disabled=True,  # no network access
-                remove=True,
-                user="nobody",  # run as non-root
+                network_disabled=True,
+                remove=False,
+                user="nobody",
             )
-            # Wait for container to finish
-            result = container.wait(timeout=self.timeout)
-            if result['StatusCode'] != 0:
-                logs = container.logs().decode()
-                return f"Execution failed with status {result['StatusCode']}:\n{logs}"
-            logs = container.logs().decode()
-            return logs
-        except docker.errors.ContainerError as e:
-            return f"Container error: {e}"
-        except docker.errors.APIError as e:
-            return f"Docker API error: {e}"
+            try:
+                container.wait(timeout=self.timeout)
+                logs = container.logs().decode("utf-8", errors="replace")
+            finally:
+                try:
+                    container.remove(force=True)
+                except Exception:
+                    pass
+            return logs or "(brak wyjścia)"
         except Exception as e:
-            return f"Unexpected error: {e}"
+            return f"Błąd wykonania: {e}"
 
-# ------------------------- Profilowanie użytkownika (fakty) -------------------------
+# ─────────────────────────── User Profiler ───────────────────────────
+
 class UserProfiler:
     def __init__(self, redis_client: redis.Redis):
         self.redis = redis_client
 
     async def add_fact(self, user_id: str, fact: str):
-        """Store a fact about the user."""
         key = f"user_facts:{user_id}"
         await self.redis.lpush(key, fact)
-        await self.redis.expire(key, 86400 * 30)  # keep for 30 days
+        await self.redis.expire(key, 86400 * 30)
 
     async def get_facts(self, user_id: str, limit: int = 10) -> List[str]:
-        """Retrieve stored facts for a user."""
         key = f"user_facts:{user_id}"
         facts = await self.redis.lrange(key, 0, limit - 1)
-        return [fact.decode() for fact in facts]
+        return [f.decode() if isinstance(f, bytes) else f for f in facts]
 
-    async def update_profile(self, user_id: str, message: str, response: str):
-        """Extract facts from conversation (simple keyword-based)."""
-        # Simple extraction: look for patterns like "preferuję X" or "używam Y"
+    async def update_profile(self, user_id: str, message: str, _response: str):
         patterns = [
-            (r"(?:preferuję|wolę|preferuję|używam) ([\w\s]+)", "preference"),
-            (r"(?:pracuję|używam) (?:na|w) ([\w\s]+)", "tech_stack"),
+            (r"(?:preferuję|wolę|używam)\s+([\w\s]+)", "preference"),
+            (r"(?:pracuję|używam)\s+(?:na|w)\s+([\w\s]+)", "tech_stack"),
         ]
         for pattern, fact_type in patterns:
             match = re.search(pattern, message, re.IGNORECASE)
             if match:
-                fact = f"{fact_type}: {match.group(1)}"
-                await self.add_fact(user_id, fact)
+                await self.add_fact(user_id, f"{fact_type}: {match.group(1).strip()}")
 
-# ------------------------- Pamięć trwała (Redis) -------------------------
+# ─────────────────────────── Persistent Memory ───────────────────────────
+
 class PersistentMemory:
     def __init__(self, redis_client: redis.Redis, ttl: int = 86400):
         self.redis = redis_client
         self.ttl = ttl
 
     async def get_history(self, session_id: str) -> List[tuple]:
-        """Get conversation history as list of (user, assistant) tuples."""
         key = f"session:{session_id}"
         raw = await self.redis.lrange(key, 0, -1)
         history = []
         for item in raw:
-            user, assistant = json.loads(item)
-            history.append((user, assistant))
+            data = item.decode() if isinstance(item, bytes) else item
+            pair = json.loads(data)
+            history.append((pair[0], pair[1]))
         return history
 
     async def add_message(self, session_id: str, user_msg: str, assistant_msg: str):
-        """Append a message pair to history."""
         key = f"session:{session_id}"
-        value = json.dumps([user_msg, assistant_msg])
-        await self.redis.rpush(key, value)
+        await self.redis.rpush(key, json.dumps([user_msg, assistant_msg]))
         await self.redis.expire(key, self.ttl)
 
     async def clear_session(self, session_id: str):
-        """Delete all history for a session."""
-        key = f"session:{session_id}"
-        await self.redis.delete(key)
+        await self.redis.delete(f"session:{session_id}")
 
     async def list_sessions(self) -> List[str]:
-        """Get all session keys (pattern: session:*)."""
         keys = await self.redis.keys("session:*")
-        return [k.decode().split(":")[1] for k in keys]
+        return [k.decode().split(":", 1)[1] if isinstance(k, bytes) else k.split(":", 1)[1] for k in keys]
 
-# ------------------------- Główna klasa HexAI -------------------------
+# ─────────────────────────── HexAI Core ───────────────────────────
+
 class HexAI:
     def __init__(self):
-        # Połączenie z Redis
-        self.redis = redis.Redis(host='localhost', port=6379, decode_responses=False)
+        self.redis = redis.Redis(host="localhost", port=6379, decode_responses=False)
         self.persistent_memory = PersistentMemory(self.redis)
         self.user_profiler = UserProfiler(self.redis)
-
-        # Model manager dla Transformers
-        self.model_manager = ModelManager(idle_timeout=600)  # 10 minut bezczynności
-        asyncio.create_task(self.model_manager.start())
-
-        # RAG
+        self.model_manager = ModelManager(idle_timeout=600)
         self.chroma_client = chromadb.PersistentClient(path="./chroma_db")
         self.advanced_rag = AdvancedRAG(self.chroma_client)
-
-        # Bezpieczne wykonywanie kodu
         self.docker_executor = DockerExecutor()
-
-        # Silnik i tryb
-        self.engine = 'transformers'
-        self.mode = 'general'
-
-        # Narzędzia
-        self.tools = {
-            'get_weather': self.get_weather,
-            'search_web': self.search_web,
-            'run_python': self.run_python
-        }
+        self.engine = "transformers"
+        self.mode = "general"
         self.max_tool_iterations = 3
-
-        # System prompts
         self.system_prompts = {
-            'general': "Jesteś pomocnym asystentem AI.",
-            'programista': (
-                "Jesteś ekspertem programistycznym na poziomie Claude. "
+            "general": (
+                "Jesteś HexAi – inteligentnym, pomocnym asystentem AI. "
+                "Odpowiadaj precyzyjnie, zwięźle i uprzejmie."
+            ),
+            "programista": (
+                "Jesteś HexAi – ekspertem programistycznym. "
                 "Twój kod jest czysty, wydajny, dobrze skomentowany i zgodny z najlepszymi praktykami. "
-                "Zawsze podajesz kompletne przykłady, uwzględniasz obsługę błędów i wyjaśniasz swoje rozwiązania. "
-                "Jeśli to możliwe, podajesz kod w różnych językach programowania i dostosowujesz go do kontekstu."
-            )
+                "Zawsze podajesz kompletne przykłady z obsługą błędów. "
+                "Wyjaśniaj swoje rozwiązania krok po kroku."
+            ),
         }
-
-        # Inicjalizacja innych komponentów (lazy loading)
+        # Lazy-loaded models
         self.whisper_model = None
         self.diffuser_pipe = None
         self.tts_model = None
         self.vision_model = None
         self.vision_processor = None
 
+    async def startup(self):
+        await self.model_manager.start()
+
     async def close(self):
         await self.model_manager.stop()
-        await self.redis.close()
+        await self.redis.aclose()
 
-    # ------------------------- Bezpieczeństwo: sanityzacja promptów -------------------------
+    # ── Sanitization ──
+
     def sanitize_prompt(self, prompt: str) -> str:
-        """Detect and neutralize prompt injection attempts."""
-        # Proste reguły: usuwanie prób zmiany roli asystenta
-        prompt = re.sub(r"(?i)(zignoruj|ignore|forget|przestań|nie słuchaj).*poprzednie.*instrukcje", "[FILTERED]", prompt)
-        prompt = re.sub(r"(?i)(podaj|give|show).*(hasło|password|secret|token|klucz|key)", "[FILTERED]", prompt)
-        return prompt
+        prompt = re.sub(
+            r"(?i)(zignoruj|ignore|forget|przestań|nie\s+słuchaj).*?instrukcje",
+            "[FILTERED]",
+            prompt,
+        )
+        prompt = re.sub(
+            r"(?i)(podaj|give|show).*(hasło|password|secret|token|klucz|key)",
+            "[FILTERED]",
+            prompt,
+        )
+        return prompt.strip()
 
-    # ------------------------- Pamięć długoterminowa (indeksowanie rozmów) -------------------------
+    # ── Long-term memory ──
+
     async def index_conversation(self, session_id: str, user_msg: str, assistant_msg: str):
-        """Automatically index conversation snippets into ChromaDB for long-term recall."""
-        # Create a combined text with metadata
         text = f"Użytkownik: {user_msg}\nAsystent: {assistant_msg}"
-        metadata = {
-            "session_id": session_id,
-            "timestamp": datetime.now().isoformat(),
-            "type": "conversation"
-        }
-        self.advanced_rag.add_documents([text], [metadata])
+        meta = {"session_id": session_id, "timestamp": datetime.now().isoformat(), "type": "conversation"}
+        self.advanced_rag.add_documents([text], [meta])
 
     async def recall_past_conversations(self, query: str, limit: int = 3) -> List[str]:
-        """Retrieve relevant past conversations from vector DB."""
-        results = self.advanced_rag.search(query, k=limit)
-        return results
+        return self.advanced_rag.search(query, k=limit)
 
-    # ------------------------- Generowanie odpowiedzi (z streamingiem) -------------------------
-    def _build_system_prompt(self) -> str:
-        """Zwraca systemowy prompt dla bieżącego trybu."""
-        return self.system_prompts.get(self.mode, self.system_prompts['general'])
+    # ── Generation (Transformers) ──
 
-    async def generate_response_transformers(self, prompt: str, history: List[tuple], stream: bool = False):
-        """Generowanie odpowiedzi przez Transformers z opcją streamingu."""
+    async def _generate_transformers(
+        self, prompt: str, history: List[tuple], stream: bool = False
+    ) -> AsyncGenerator[str, None]:
+        """Always an async generator – yields chunks or single full response."""
         model, tokenizer = await self.model_manager.get_model()
-        system_prompt = self._build_system_prompt()
-        formatted_history = f"[INST] {system_prompt} [/INST] (System prompt) </s>\n"
-        for user_msg, assistant_msg in history:
-            formatted_history += f"[INST] {user_msg} [/INST] {assistant_msg} </s>\n"
-        formatted_history += f"[INST] {prompt} [/INST]"
-        inputs = tokenizer(formatted_history, return_tensors="pt").to(model.device)
+        system_prompt = self.system_prompts.get(self.mode, self.system_prompts["general"])
+
+        formatted = f"[INST] {system_prompt} [/INST]\n"
+        for u, a in history:
+            formatted += f"[INST] {u} [/INST] {a} </s>\n"
+        formatted += f"[INST] {prompt} [/INST]"
+
+        inputs = tokenizer(formatted, return_tensors="pt").to(model.device)
 
         if stream:
-            streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, timeout=10)
-            generation_kwargs = dict(inputs, max_new_tokens=150, streamer=streamer)
-            # Run generation in a separate thread
+            streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, timeout=30)
             import threading
-            thread = threading.Thread(target=model.generate, kwargs=generation_kwargs)
+            gen_kwargs = dict(**inputs, max_new_tokens=512, streamer=streamer, do_sample=True, temperature=0.7)
+            thread = threading.Thread(target=model.generate, kwargs=gen_kwargs)
             thread.start()
-            # Yield tokens as they arrive
-            for text in streamer:
-                yield text
+            for token in streamer:
+                yield token
         else:
-            outputs = model.generate(**inputs, max_new_tokens=150)
-            response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-            response = response.split("[/INST]")[-1].strip()
-            return response
+            with torch.inference_mode():
+                outputs = model.generate(**inputs, max_new_tokens=512, do_sample=True, temperature=0.7)
+            text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+            response = text.split("[/INST]")[-1].strip()
+            yield response
 
-    async def generate_response_ollama(self, prompt: str, history: List[tuple], stream: bool = False):
-        """Generowanie odpowiedzi przez Ollama z opcją streamingu."""
-        system_prompt = self._build_system_prompt()
+    # ── Generation (Ollama) ──
+
+    async def _generate_ollama(
+        self, prompt: str, history: List[tuple], stream: bool = False
+    ) -> AsyncGenerator[str, None]:
+        system_prompt = self.system_prompts.get(self.mode, self.system_prompts["general"])
         messages = []
-        for user_msg, assistant_msg in history:
-            messages.append({'role': 'user', 'content': user_msg})
-            messages.append({'role': 'assistant', 'content': assistant_msg})
-        messages.append({'role': 'user', 'content': prompt})
+        for u, a in history:
+            messages.append({"role": "user", "content": u})
+            messages.append({"role": "assistant", "content": a})
+        messages.append({"role": "user", "content": prompt})
 
         if stream:
-            # Ollama supports streaming
             response_stream = ollama.chat(
-                model=self._get_ollama_model(),
+                model=self._ollama_model(),
                 messages=messages,
                 system=system_prompt,
-                stream=True
+                stream=True,
             )
             for chunk in response_stream:
-                yield chunk['message']['content']
+                yield chunk["message"]["content"]
         else:
             response = ollama.chat(
-                model=self._get_ollama_model(),
+                model=self._ollama_model(),
                 messages=messages,
-                system=system_prompt
+                system=system_prompt,
             )
-            return response['message']['content']
+            yield response["message"]["content"]
 
-    def _get_ollama_model(self):
-        """Zwraca nazwę modelu Ollama w zależności od trybu."""
-        if self.mode == 'programista':
-            return "codellama:7b-instruct"
-        return "llama2"
+    def _ollama_model(self) -> str:
+        return "codellama:7b-instruct" if self.mode == "programista" else "llama2"
 
-    # ------------------------- Główna metoda chat (rozdzielona) -------------------------
-    async def _chat_nonstream(self, session_id: str, prompt: str) -> str:
-        """Non‑streaming version of chat."""
-        # Sanityzacja promptu
+    # ── Generator dispatcher ──
+
+    def _get_generator(self, prompt: str, history: List[tuple], stream: bool) -> AsyncGenerator[str, None]:
+        if self.engine == "transformers":
+            return self._generate_transformers(prompt, history, stream)
+        return self._generate_ollama(prompt, history, stream)
+
+    # ── Tool helpers ──
+
+    def parse_tool_call(self, text: str) -> List[tuple]:
+        pattern = r"\{tool:(\w+)\s+(.+?)\}"
+        matches = re.findall(pattern, text)
+        result = []
+        for tool_name, args_str in matches:
+            args = dict(re.findall(r'(\w+)="([^"]+)"', args_str))
+            result.append((tool_name, args))
+        return result
+
+    def execute_tool(self, tool_name: str, args: Dict) -> str:
+        tools = {
+            "get_weather": self.get_weather,
+            "search_web": self.search_web,
+        }
+        fn = tools.get(tool_name)
+        if fn is None:
+            return f"Narzędzie '{tool_name}' nie istnieje."
+        try:
+            return fn(**args)
+        except Exception as e:
+            return f"Błąd narzędzia: {e}"
+
+    def get_weather(self, city: str = "Warsaw") -> str:
+        return f"Pogoda w {city}: słonecznie, 22°C."
+
+    def search_web(self, query: str = "") -> str:
+        api_key = os.environ.get("SERPER_API_KEY")
+        if api_key:
+            try:
+                url = "https://google.serper.dev/search"
+                headers = {"X-API-KEY": api_key, "Content-Type": "application/json"}
+                data = json.dumps({"q": query, "num": 5})
+                resp = requests.post(url, headers=headers, data=data, timeout=10)
+                if resp.ok:
+                    items = resp.json().get("organic", [])
+                    return "\n".join(f"{i['title']}: {i['snippet']}" for i in items)
+            except Exception as e:
+                return f"Błąd Serper: {e}"
+        try:
+            with DDGS() as ddgs:
+                results = list(ddgs.text(query, max_results=3))
+            return "\n".join(f"{r['title']}: {r['body']}" for r in results)
+        except Exception as e:
+            return f"Błąd wyszukiwania: {e}"
+
+    # ── Core chat helpers ──
+
+    async def _build_prompt_with_context(self, session_id: str, prompt: str) -> tuple[str, List[tuple]]:
+        """Returns (enriched_prompt, history_list)."""
         prompt = self.sanitize_prompt(prompt)
-
-        # Pobierz historię sesji z Redis
         history = await self.persistent_memory.get_history(session_id)
-        history_list = [(h[0], h[1]) for h in history]
 
-        # Sprawdź, czy pytanie dotyczy przeszłych rozmów (pamięć długoterminowa)
-        recall_trigger = re.search(r'(pamiętasz|co ustaliliśmy|co mówiliśmy|przypomnij)', prompt, re.IGNORECASE)
-        if recall_trigger:
-            past_conversations = await self.recall_past_conversations(prompt)
-            if past_conversations:
-                context = "\n\nPoprzednie rozmowy:\n" + "\n".join(past_conversations)
-                prompt = f"{prompt}\n\n{context}"
+        if re.search(r"(pamiętasz|co ustaliliśmy|co mówiliśmy|przypomnij)", prompt, re.IGNORECASE):
+            past = await self.recall_past_conversations(prompt)
+            if past:
+                prompt += "\n\nPoprzednie rozmowy:\n" + "\n".join(past)
 
-        # Pobierz fakty o użytkowniku
         facts = await self.user_profiler.get_facts(session_id)
         if facts:
-            prompt = f"Fakty o użytkowniku: {', '.join(facts)}\n\n{prompt}"
+            prompt = "Fakty o użytkowniku: " + ", ".join(facts) + "\n\n" + prompt
 
-        # Dodaj nową wiadomość do historii (tymczasowo)
-        history_list.append((prompt, ""))
+        return prompt, list(history)
 
-        # Pętla narzędzi
+    async def _run_tool_loop_stream(
+        self, session_id: str, prompt: str, history: List[tuple]
+    ) -> AsyncGenerator[str, None]:
         current_prompt = prompt
+        history_copy = history + [(prompt, "")]
         final_response = ""
-        iteration = 0
-        while iteration < self.max_tool_iterations:
-            if self.engine == 'transformers':
-                response = await self.generate_response_transformers(current_prompt, history_list, stream=False)
-            else:
-                response = await self.generate_response_ollama(current_prompt, history_list, stream=False)
 
-            tool_calls = self.parse_tool_call(response)
+        for iteration in range(self.max_tool_iterations):
+            gen = self._get_generator(current_prompt, history_copy[:-1], stream=True)
+            chunks: List[str] = []
+            async for chunk in gen:
+                chunks.append(chunk)
+                yield chunk
+            full = "".join(chunks)
+
+            tool_calls = self.parse_tool_call(full)
             if not tool_calls:
-                # Koniec
-                history_list[-1] = (prompt, response)
-                final_response = response
+                history_copy[-1] = (prompt, full)
+                final_response = full
                 break
 
-            # Wykonaj narzędzia
             tool_results = []
-            for tool_name, args in tool_calls:
-                result = await asyncio.to_thread(self.execute_tool, tool_name, args)
-                tool_results.append(f"Narzędzie {tool_name} zwróciło: {result}")
+            for tname, targs in tool_calls:
+                res = await asyncio.to_thread(self.execute_tool, tname, targs)
+                tool_results.append(f"Narzędzie {tname}: {res}")
 
-            clean_response = re.sub(r'\{tool:.*?\}', '', response).strip()
-            history_list[-1] = (prompt, clean_response)
-            tool_summary = "\n".join(tool_results)
-            history_list.append(("(tool results)", tool_summary))
-            current_prompt = f"Kontynuuj, uwzględniając wyniki narzędzi: {tool_summary}"
-            iteration += 1
+            clean = re.sub(r"\{tool:.*?\}", "", full).strip()
+            history_copy[-1] = (prompt, clean)
+            summary = "\n".join(tool_results)
+            history_copy.append(("(tool results)", summary))
+            current_prompt = f"Kontynuuj uwzględniając wyniki narzędzi: {summary}"
 
-        # Zapisz w pamięci trwałej
+        if final_response:
+            await self.persistent_memory.add_message(session_id, prompt, final_response)
+            await self.index_conversation(session_id, prompt, final_response)
+            await self.user_profiler.update_profile(session_id, prompt, final_response)
+
+    async def _run_tool_loop_sync(
+        self, session_id: str, prompt: str, history: List[tuple]
+    ) -> str:
+        current_prompt = prompt
+        history_copy = history + [(prompt, "")]
+        final_response = ""
+
+        for iteration in range(self.max_tool_iterations):
+            gen = self._get_generator(current_prompt, history_copy[:-1], stream=False)
+            chunks: List[str] = []
+            async for chunk in gen:
+                chunks.append(chunk)
+            full = "".join(chunks)
+
+            tool_calls = self.parse_tool_call(full)
+            if not tool_calls:
+                history_copy[-1] = (prompt, full)
+                final_response = full
+                break
+
+            tool_results = []
+            for tname, targs in tool_calls:
+                res = await asyncio.to_thread(self.execute_tool, tname, targs)
+                tool_results.append(f"Narzędzie {tname}: {res}")
+
+            clean = re.sub(r"\{tool:.*?\}", "", full).strip()
+            history_copy[-1] = (prompt, clean)
+            summary = "\n".join(tool_results)
+            history_copy.append(("(tool results)", summary))
+            current_prompt = f"Kontynuuj uwzględniając wyniki narzędzi: {summary}"
+
         if final_response:
             await self.persistent_memory.add_message(session_id, prompt, final_response)
             await self.index_conversation(session_id, prompt, final_response)
@@ -579,184 +613,63 @@ class HexAI:
 
         return final_response
 
-    async def _chat_stream(self, session_id: str, prompt: str) -> AsyncGenerator[str, None]:
-        """Streaming version of chat."""
-        # Sanityzacja promptu
-        prompt = self.sanitize_prompt(prompt)
-
-        # Pobierz historię sesji z Redis
-        history = await self.persistent_memory.get_history(session_id)
-        history_list = [(h[0], h[1]) for h in history]
-
-        # Sprawdź, czy pytanie dotyczy przeszłych rozmów (pamięć długoterminowa)
-        recall_trigger = re.search(r'(pamiętasz|co ustaliliśmy|co mówiliśmy|przypomnij)', prompt, re.IGNORECASE)
-        if recall_trigger:
-            past_conversations = await self.recall_past_conversations(prompt)
-            if past_conversations:
-                context = "\n\nPoprzednie rozmowy:\n" + "\n".join(past_conversations)
-                prompt = f"{prompt}\n\n{context}"
-
-        # Pobierz fakty o użytkowniku
-        facts = await self.user_profiler.get_facts(session_id)
-        if facts:
-            prompt = f"Fakty o użytkowniku: {', '.join(facts)}\n\n{prompt}"
-
-        # Dodaj nową wiadomość do historii (tymczasowo)
-        history_list.append((prompt, ""))
-
-        # Pętla narzędzi
-        current_prompt = prompt
-        final_response = ""
-        iteration = 0
-        while iteration < self.max_tool_iterations:
-            if self.engine == 'transformers':
-                generator = self.generate_response_transformers(current_prompt, history_list, stream=True)
-            else:
-                generator = self.generate_response_ollama(current_prompt, history_list, stream=True)
-
-            # Zbieramy odpowiedź w całości (do wykrycia narzędzi) i jednocześnie strumieniujemy
-            collected_chunks = []
-            async for chunk in generator:
-                collected_chunks.append(chunk)
-                yield chunk
-            full_response = "".join(collected_chunks)
-
-            tool_calls = self.parse_tool_call(full_response)
-            if not tool_calls:
-                # Koniec
-                history_list[-1] = (prompt, full_response)
-                final_response = full_response
-                break
-
-            # Wykonaj narzędzia
-            tool_results = []
-            for tool_name, args in tool_calls:
-                result = await asyncio.to_thread(self.execute_tool, tool_name, args)
-                tool_results.append(f"Narzędzie {tool_name} zwróciło: {result}")
-
-            clean_response = re.sub(r'\{tool:.*?\}', '', full_response).strip()
-            history_list[-1] = (prompt, clean_response)
-            tool_summary = "\n".join(tool_results)
-            history_list.append(("(tool results)", tool_summary))
-            current_prompt = f"Kontynuuj, uwzględniając wyniki narzędzi: {tool_summary}"
-            iteration += 1
-
-        # Zapisz w pamięci trwałej
-        if final_response:
-            await self.persistent_memory.add_message(session_id, prompt, final_response)
-            await self.index_conversation(session_id, prompt, final_response)
-            await self.user_profiler.update_profile(session_id, prompt, final_response)
-
-    async def chat(self, session_id: str, prompt: str, stream: bool = False) -> Any:
-        """Główna metoda – wywołuje odpowiednią wersję w zależności od stream."""
+    async def chat(self, session_id: str, prompt: str, stream: bool = False):
+        enriched, history = await self._build_prompt_with_context(session_id, prompt)
         if stream:
-            return self._chat_stream(session_id, prompt)
+            return self._run_tool_loop_stream(session_id, enriched, history)
+        return await self._run_tool_loop_sync(session_id, enriched, history)
+
+    # ── RAG ──
+
+    async def rag_query(self, query: str) -> str:
+        results = self.advanced_rag.hybrid_search(query, k=3)
+        if not results:
+            context = "Brak dokumentów w bazie wiedzy."
         else:
-            return await self._chat_nonstream(session_id, prompt)
+            context = "\n".join(results)
+        prompt = f"Odpowiedz na pytanie na podstawie kontekstu:\n\n{context}\n\nPytanie: {query}"
+        chunks: List[str] = []
+        async for chunk in self._get_generator(prompt, [], stream=False):
+            chunks.append(chunk)
+        return "".join(chunks)
 
-    # ------------------------- Narzędzia -------------------------
-    def get_weather(self, city: str) -> str:
-        return f"Pogoda w {city}: słonecznie, 22°C."
-
-    def search_web(self, query: str) -> str:
-        """Wyszukiwanie web z użyciem Google Search API (Serper) zamiast DuckDuckGo."""
-        api_key = os.environ.get("SERPER_API_KEY")
-        if api_key:
-            url = "https://google.serper.dev/search"
-            headers = {"X-API-KEY": api_key, "Content-Type": "application/json"}
-            payload = json.dumps({"q": query, "num": 5})
-            response = requests.post(url, headers=headers, data=payload)
-            if response.status_code == 200:
-                data = response.json()
-                snippets = [f"{item['title']}: {item['snippet']}" for item in data.get("organic", [])]
-                return "\n".join(snippets)
-            else:
-                return f"Błąd API Google: {response.status_code}"
-        else:
-            # Fallback do DuckDuckGo
-            try:
-                with DDGS() as ddgs:
-                    results = list(ddgs.text(query, max_results=3))
-                    snippets = [f"{r['title']}: {r['body']}" for r in results]
-                    return "\n".join(snippets)
-            except Exception as e:
-                return f"Błąd wyszukiwania: {e}"
-
-    async def run_python(self, code: str) -> str:
-        """Bezpieczne wykonanie kodu w Dockerze."""
-        return await self.docker_executor.run_code(code)
-
-    def parse_tool_call(self, text: str) -> List[tuple]:
-        pattern = r'\{tool:(\w+)\s+(.+?)\}'
-        matches = re.findall(pattern, text)
-        tool_calls = []
-        for tool_name, args_str in matches:
-            args = {}
-            arg_pattern = r'(\w+)="([^"]+)"'
-            for key, value in re.findall(arg_pattern, args_str):
-                args[key] = value
-            tool_calls.append((tool_name, args))
-        return tool_calls
-
-    def execute_tool(self, tool_name: str, args: Dict) -> str:
-        if tool_name in self.tools:
-            return self.tools[tool_name](**args)
-        else:
-            return f"Narzędzie {tool_name} nie istnieje."
-
-    # ------------------------- Zaawansowany RAG -------------------------
-    async def rag_query(self, query: str, use_hybrid: bool = True) -> str:
-        """Zapytanie do bazy wiedzy z opcją hybrydowego wyszukiwania."""
-        if use_hybrid:
-            results = self.advanced_rag.hybrid_search(query, k=3)
-        else:
-            results = self.advanced_rag.search(query, k=3)
-        context = "\n".join(results)
-        prompt = f"Odpowiedz na pytanie na podstawie poniższego kontekstu:\n\n{context}\n\nPytanie: {query}"
-        if self.engine == 'transformers':
-            response = await self.generate_response_transformers(prompt, [], stream=False)
-        else:
-            response = await self.generate_response_ollama(prompt, [], stream=False)
-        return response
-
-    async def ingest_document(self, source: str, chunk_size: int = 500, chunk_overlap: int = 100):
-        """Dodaje dokument (URL, plik lokalny) z podziałem na fragmenty."""
-        if source.startswith('http://') or source.startswith('https://'):
-            try:
-                resp = requests.get(source)
-                if 'application/pdf' in resp.headers.get('Content-Type', ''):
-                    pdf_file = BytesIO(resp.content)
-                    pdf_reader = pypdf.PdfReader(pdf_file)
-                    text = ""
-                    for page in pdf_reader.pages:
-                        text += page.extract_text()
+    async def ingest_document(self, source: str, chunk_size: int = 500, chunk_overlap: int = 100) -> str:
+        text = ""
+        try:
+            if source.startswith("http://") or source.startswith("https://"):
+                resp = requests.get(source, timeout=30)
+                ct = resp.headers.get("Content-Type", "")
+                if "application/pdf" in ct:
+                    reader = pypdf.PdfReader(BytesIO(resp.content))
+                    text = "".join(p.extract_text() or "" for p in reader.pages)
                 else:
-                    soup = BeautifulSoup(resp.text, 'html.parser')
-                    text = soup.get_text()
-            except Exception as e:
-                return f"Błąd pobierania: {e}"
-        else:
-            if not os.path.exists(source):
-                return f"Plik {source} nie istnieje."
-            if source.endswith('.pdf'):
-                pdf_reader = pypdf.PdfReader(source)
-                text = ""
-                for page in pdf_reader.pages:
-                    text += page.extract_text()
+                    soup = BeautifulSoup(resp.text, "html.parser")
+                    text = soup.get_text(separator=" ", strip=True)
             else:
-                with open(source, 'r', encoding='utf-8') as f:
-                    text = f.read()
+                if not os.path.exists(source):
+                    return f"Plik {source} nie istnieje."
+                if source.endswith(".pdf"):
+                    reader = pypdf.PdfReader(source)
+                    text = "".join(p.extract_text() or "" for p in reader.pages)
+                else:
+                    with open(source, encoding="utf-8") as f:
+                        text = f.read()
+        except Exception as e:
+            return f"Błąd pobierania: {e}"
 
-        # Podział na fragmenty
+        if not text.strip():
+            return "Dokument jest pusty lub nie można wyodrębnić tekstu."
+
         parser = SimpleNodeParser.from_defaults(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
         nodes = parser.get_nodes_from_documents([Document(text=text)])
-        texts = [node.text for node in nodes]
-        metadatas = [{"source": source, "chunk": i} for i in range(len(texts))]
-        self.advanced_rag.add_documents(texts, metadatas)
+        texts = [n.text for n in nodes]
+        metas = [{"source": source, "chunk": i} for i in range(len(texts))]
+        self.advanced_rag.add_documents(texts, metas)
         return f"Zindeksowano {len(texts)} fragmentów z {source}"
 
-    # ------------------------- Multimodalność: Vision -------------------------
-    async def load_vision_model(self):
+    # ── Vision ──
+
+    async def _load_vision_model(self):
         if self.vision_model is None:
             from transformers import AutoProcessor, LlavaForConditionalGeneration
             model_id = "llava-hf/llava-1.5-7b-hf"
@@ -766,45 +679,49 @@ class HexAI:
             self.vision_processor = AutoProcessor.from_pretrained(model_id)
 
     async def analyze_image(self, image_bytes: bytes, prompt: str = "Describe this image.") -> str:
-        """Opis obrazu przy użyciu modelu LLaVA."""
-        await self.load_vision_model()
+        await self._load_vision_model()
         from PIL import Image
         image = Image.open(BytesIO(image_bytes))
         inputs = self.vision_processor(images=image, text=prompt, return_tensors="pt").to(self.vision_model.device)
-        outputs = self.vision_model.generate(**inputs, max_new_tokens=200)
-        description = self.vision_processor.decode(outputs[0], skip_special_tokens=True)
-        return description
+        with torch.inference_mode():
+            outputs = self.vision_model.generate(**inputs, max_new_tokens=200)
+        return self.vision_processor.decode(outputs[0], skip_special_tokens=True)
 
-    # ------------------------- TTS (Text-to-Speech) -------------------------
-    async def load_tts_model(self):
+    # ── TTS ──
+
+    async def _load_tts(self):
         if self.tts_model is None:
-            self.tts_model = TTS(language='PL')
-            self.speed = 1.0
+            from melo.api import TTS
+            self.tts_model = TTS(language="PL")
 
     async def text_to_speech(self, text: str) -> bytes:
-        """Konwersja tekstu na mowę (zwraca bytes audio)."""
-        await self.load_tts_model()
-        output_path = "output.wav"
-        self.tts_model.tts_to_file(text, self.tts_model.hps.data.spk2id['PL'], output_path, speed=self.speed)
-        with open(output_path, 'rb') as f:
-            audio_bytes = f.read()
-        os.remove(output_path)
-        return audio_bytes
+        await self._load_tts()
+        path = f"/tmp/hexai_tts_{uuid.uuid4().hex}.wav"
+        spk_id = self.tts_model.hps.data.spk2id.get("PL", 0)
+        self.tts_model.tts_to_file(text, spk_id, path, speed=1.0)
+        with open(path, "rb") as f:
+            data = f.read()
+        os.remove(path)
+        return data
 
-    # ------------------------- Audio (Whisper) -------------------------
-    async def load_whisper_model(self):
+    # ── Whisper ──
+
+    async def _load_whisper(self):
         if self.whisper_model is None:
+            import whisper
             device = "cuda" if torch.cuda.is_available() else "cpu"
             self.whisper_model = whisper.load_model("small", device=device)
 
     async def transcribe_audio(self, file_path: str) -> str:
-        await self.load_whisper_model()
+        await self._load_whisper()
         result = await asyncio.to_thread(self.whisper_model.transcribe, file_path)
         return result["text"]
 
-    # ------------------------- Obrazy (Stable Diffusion) -------------------------
-    async def load_diffuser_pipe(self):
+    # ── Image generation ──
+
+    async def _load_diffuser(self):
         if self.diffuser_pipe is None:
+            from diffusers import StableDiffusionPipeline
             self.diffuser_pipe = StableDiffusionPipeline.from_pretrained(
                 "CompVis/stable-diffusion-v1-4", torch_dtype=torch.float16
             )
@@ -812,113 +729,147 @@ class HexAI:
                 self.diffuser_pipe = self.diffuser_pipe.to("cuda")
 
     async def generate_image(self, prompt: str) -> str:
-        await self.load_diffuser_pipe()
-        image = await asyncio.to_thread(self.diffuser_pipe, prompt)
-        image = image.images[0]
-        buffered = BytesIO()
-        image.save(buffered, format="PNG")
-        img_base64 = base64.b64encode(buffered.getvalue()).decode()
-        return img_base64
+        await self._load_diffuser()
+        image_result = await asyncio.to_thread(self.diffuser_pipe, prompt)
+        image = image_result.images[0]
+        buf = BytesIO()
+        image.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode()
 
-    # ------------------------- Statystyki -------------------------
-    def get_stats(self):
-        vram_used = None
-        vram_total = None
+    # ── Stats ──
+
+    async def get_stats(self) -> Dict:
+        vram_used = vram_total = None
         if torch.cuda.is_available():
-            vram_used = torch.cuda.memory_allocated() / 1024**3
-            vram_total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+            vram_used = torch.cuda.memory_allocated() / 1024 ** 3
+            vram_total = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3
+        try:
+            sessions = await self.persistent_memory.list_sessions()
+            n_sessions = len(sessions)
+        except Exception:
+            n_sessions = 0
         return {
             "engine": self.engine,
             "mode": self.mode,
             "vram_used_gb": vram_used,
             "vram_total_gb": vram_total,
-            "active_sessions": len(asyncio.run(self.persistent_memory.list_sessions())),
+            "active_sessions": n_sessions,
             "history_len": 0,
             "model_loaded": self.model_manager.is_loaded(),
-            "model_idle_seconds": self.model_manager.idle_seconds()
+            "model_idle_seconds": self.model_manager.idle_seconds(),
         }
 
-# ------------------------- Inicjalizacja -------------------------
+
+# ─────────────────────────── App Lifecycle ───────────────────────────
+
 hexai = HexAI()
 
-# ------------------------- Endpointy -------------------------
+
+@app.on_event("startup")
+async def startup():
+    await hexai.startup()
+
+
 @app.on_event("shutdown")
 async def shutdown():
     await hexai.close()
 
+
+# ─────────────────────────── Endpoints ───────────────────────────
+
 @app.post("/chat")
 async def chat_endpoint(request: ChatRequest):
-    """Główny endpoint do konwersacji. Jeśli stream=True, zwraca strumień."""
     session_id = request.session_id or str(uuid.uuid4())
     if request.stream:
-        return StreamingResponse(
-            hexai.chat(session_id, request.message, stream=True),
-            media_type="text/plain"
-        )
+        generator = await hexai.chat(session_id, request.message, stream=True)
+        return StreamingResponse(generator, media_type="text/plain")
     else:
         response = await hexai.chat(session_id, request.message, stream=False)
         return ChatResponse(session_id=session_id, response=response)
 
+
 @app.post("/engine")
 async def set_engine(request: EngineRequest):
+    if request.engine not in ("transformers", "ollama"):
+        raise HTTPException(400, "Nieprawidłowy silnik")
     hexai.engine = request.engine
-    return {"message": f"Silnik zmieniony na {request.engine}"}
+    return {"message": f"Silnik: {request.engine}"}
+
 
 @app.post("/mode")
 async def set_mode(request: ModeRequest):
+    if request.mode not in ("general", "programista"):
+        raise HTTPException(400, "Nieprawidłowy tryb")
     hexai.mode = request.mode
-    return {"message": f"Tryb zmieniony na {request.mode}"}
+    return {"message": f"Tryb: {request.mode}"}
+
 
 @app.post("/rag")
 async def rag_query(request: RagRequest):
     response = await hexai.rag_query(request.query)
     return {"response": response}
 
+
 @app.post("/ingest")
 async def ingest_document(request: IngestRequest):
     result = await hexai.ingest_document(request.source, request.chunk_size, request.chunk_overlap)
     return {"message": result}
 
+
 @app.post("/generate_image")
 async def generate_image(request: ImageRequest):
-    img_base64 = await hexai.generate_image(request.prompt)
-    return {"image_base64": img_base64}
+    img = await hexai.generate_image(request.prompt)
+    return {"image_base64": img}
+
 
 @app.post("/transcribe")
 async def transcribe_audio(file: UploadFile = File(...)):
-    temp_path = f"temp_{file.filename}"
-    with open(temp_path, "wb") as f:
+    path = f"/tmp/hexai_audio_{uuid.uuid4().hex}_{file.filename}"
+    with open(path, "wb") as f:
         f.write(await file.read())
-    transcription = await hexai.transcribe_audio(temp_path)
-    os.remove(temp_path)
+    try:
+        transcription = await hexai.transcribe_audio(path)
+    finally:
+        if os.path.exists(path):
+            os.remove(path)
     return {"transcription": transcription}
+
 
 @app.post("/analyze_image")
 async def analyze_image(file: UploadFile = File(...), prompt: str = Form("Describe this image.")):
-    image_bytes = await file.read()
-    description = await hexai.analyze_image(image_bytes, prompt)
+    data = await file.read()
+    description = await hexai.analyze_image(data, prompt)
     return {"description": description}
+
 
 @app.get("/tts")
 async def text_to_speech(text: str):
-    audio_bytes = await hexai.text_to_speech(text)
-    return StreamingResponse(BytesIO(audio_bytes), media_type="audio/wav")
+    audio = await hexai.text_to_speech(text)
+    return StreamingResponse(BytesIO(audio), media_type="audio/wav")
+
 
 @app.get("/stats", response_model=StatsResponse)
 async def stats():
-    stats_data = hexai.get_stats()
-    return StatsResponse(**stats_data)
+    data = await hexai.get_stats()
+    return StatsResponse(**data)
+
 
 @app.get("/sessions")
 async def list_sessions():
     sessions = await hexai.persistent_memory.list_sessions()
     return {"sessions": sessions}
 
+
 @app.delete("/session/{session_id}")
 async def delete_session(session_id: str):
     await hexai.persistent_memory.clear_session(session_id)
     return {"message": f"Sesja {session_id} usunięta"}
 
-# ------------------------- Uruchomienie -------------------------
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "version": "2.0.0"}
+
+
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
