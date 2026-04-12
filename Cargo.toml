@@ -1,7 +1,19 @@
 [package]
-name = "HexAI"
+name = "hexai-builder"
 version = "0.1.0"
 edition = "2021"
+description = "HexAi – Builder: packages Python app into a standalone binary"
+authors = ["HackerOS Team <hackeros068@gmail.com>"]
+license = "GPL-3.0"
+
+[[bin]]
+name = "hexai-builder"
+path = "src/main.rs"
 
 [dependencies]
 walkdir = "2"
+
+[profile.release]
+opt-level = 3
+lto       = true
+strip     = true
