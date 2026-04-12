@@ -1,43 +1,50 @@
-# Core dependencies
+# ── Web framework ──────────────────────────────────────────────────────────────
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
 pydantic==2.10.4
+python-multipart==0.0.20
 
-# Memory and vector DB
+# ── Database / memory ──────────────────────────────────────────────────────────
 redis==5.2.1
 chromadb>=0.6.0,<0.7.0
+
+# ── RAG / retrieval ────────────────────────────────────────────────────────────
 rank-bm25==0.2.2
 sentence-transformers==3.3.1
 
-# Web and document parsing
+# ── Document parsing ───────────────────────────────────────────────────────────
 beautifulsoup4==4.12.3
 pypdf==5.1.0
 duckduckgo-search==7.1.0
 
-# Docker execution
+# ── Sandboxed code execution ───────────────────────────────────────────────────
 docker==7.1.0
 
-# LLM and AI models
+# ── LLM inference (Transformers + Ollama) ─────────────────────────────────────
 accelerate==1.2.1
 transformers==4.48.0
+bitsandbytes==0.45.0
 torch==2.6.0
 torchaudio==2.6.0
 ollama==0.4.5
 
-# RAG and indexing
-llama-index>=0.12.9,<0.13.0
-llama-index-vector-stores-chroma>=0.4.0,<0.5.0
+# ── RAG indexing ───────────────────────────────────────────────────────────────
 llama-index-core>=0.12.9,<0.13.0
+llama-index-vector-stores-chroma>=0.4.0,<0.5.0
 
-# Audio and speech (transcription and TTS)
-# UWAGA: faster-whisper i openai-whisper są pominięte ze względu na brak kompatybilności z Python 3.13.
-# Jeśli potrzebujesz transkrypcji audio, zainstaluj je ręcznie w środowisku Python 3.11 lub 3.12.
+# ── Audio / speech ─────────────────────────────────────────────────────────────
+# NOTE: openai-whisper requires Python ≤ 3.12.
+# Install manually in a Python 3.11/3.12 venv if transcription is needed:
+#   pip install openai-whisper
 soundfile==0.12.1
-melo>=1.0.1
+# melo TTS – install from source if pip package unavailable:
+#   pip install git+https://github.com/myshell-ai/MeloTTS.git
+# melo>=1.0.1
 
-# Image generation and vision
+# ── Vision / image generation ──────────────────────────────────────────────────
 diffusers==0.31.0
 Pillow==11.1.0
 
-# Utilities
+# ── Utilities ──────────────────────────────────────────────────────────────────
 rich==13.9.4
+requests==2.32.3
