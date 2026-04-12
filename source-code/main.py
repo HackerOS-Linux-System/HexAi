@@ -7,6 +7,7 @@ import uuid
 import json
 import time
 import base64
+from contextlib import asynccontextmanager
 from io import BytesIO
 from typing import Optional, List, Dict, Any, AsyncGenerator
 from datetime import datetime
@@ -28,6 +29,15 @@ from pydantic import BaseModel, Field
 from rich.console import Console
 import uvicorn
 
+# Ensure python-multipart is available for file uploads
+try:
+    import multipart  # noqa: F401
+except ImportError:
+    raise RuntimeError(
+        "python-multipart is required for file uploads.\n"
+        "Install it with:  pip install python-multipart"
+    )
+
 from accelerate import Accelerator
 from transformers import (
     AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig,
@@ -37,7 +47,20 @@ import ollama
 from llama_index.core import Document
 from llama_index.core.node_parser import SimpleNodeParser
 
-app = FastAPI(title="HexAi API", version="2.0.0")
+console = Console()
+
+# ─────────────────────────── Lifespan ───────────────────────────
+# Forward-declared; hexai instance is created after class definitions.
+_hexai_instance: "HexAI | None" = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _hexai_instance
+    await _hexai_instance.startup()
+    yield
+    await _hexai_instance.close()
+
+app = FastAPI(title="HexAi API", version="2.0.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -45,7 +68,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-console = Console()
 
 # ─────────────────────────── Pydantic Models ───────────────────────────
 
@@ -288,16 +310,26 @@ class DockerExecutor:
 class UserProfiler:
     def __init__(self, redis_client: redis.Redis):
         self.redis = redis_client
+        self._fallback: dict[str, list] = {}
 
     async def add_fact(self, user_id: str, fact: str):
-        key = f"user_facts:{user_id}"
-        await self.redis.lpush(key, fact)
-        await self.redis.expire(key, 86400 * 30)
+        if user_id not in self._fallback:
+            self._fallback[user_id] = []
+        self._fallback[user_id].insert(0, fact)
+        try:
+            key = f"user_facts:{user_id}"
+            await self.redis.lpush(key, fact)
+            await self.redis.expire(key, 86400 * 30)
+        except Exception:
+            pass
 
     async def get_facts(self, user_id: str, limit: int = 10) -> List[str]:
-        key = f"user_facts:{user_id}"
-        facts = await self.redis.lrange(key, 0, limit - 1)
-        return [f.decode() if isinstance(f, bytes) else f for f in facts]
+        try:
+            key = f"user_facts:{user_id}"
+            facts = await self.redis.lrange(key, 0, limit - 1)
+            return [f.decode() if isinstance(f, bytes) else f for f in facts]
+        except Exception:
+            return self._fallback.get(user_id, [])[:limit]
 
     async def update_profile(self, user_id: str, message: str, _response: str):
         patterns = [
@@ -315,28 +347,60 @@ class PersistentMemory:
     def __init__(self, redis_client: redis.Redis, ttl: int = 86400):
         self.redis = redis_client
         self.ttl = ttl
+        # In-memory fallback when Redis is unavailable
+        self._fallback: dict[str, list] = {}
+
+    async def _redis_ok(self) -> bool:
+        try:
+            await self.redis.ping()
+            return True
+        except Exception:
+            return False
 
     async def get_history(self, session_id: str) -> List[tuple]:
-        key = f"session:{session_id}"
-        raw = await self.redis.lrange(key, 0, -1)
-        history = []
-        for item in raw:
-            data = item.decode() if isinstance(item, bytes) else item
-            pair = json.loads(data)
-            history.append((pair[0], pair[1]))
-        return history
+        try:
+            key = f"session:{session_id}"
+            raw = await self.redis.lrange(key, 0, -1)
+            history = []
+            for item in raw:
+                data = item.decode() if isinstance(item, bytes) else item
+                pair = json.loads(data)
+                history.append((pair[0], pair[1]))
+            return history
+        except Exception:
+            return [(u, a) for u, a in self._fallback.get(session_id, [])]
 
     async def add_message(self, session_id: str, user_msg: str, assistant_msg: str):
-        key = f"session:{session_id}"
-        await self.redis.rpush(key, json.dumps([user_msg, assistant_msg]))
-        await self.redis.expire(key, self.ttl)
+        # Always update in-memory fallback
+        if session_id not in self._fallback:
+            self._fallback[session_id] = []
+        self._fallback[session_id].append((user_msg, assistant_msg))
+        # Keep fallback bounded
+        if len(self._fallback[session_id]) > 50:
+            self._fallback[session_id] = self._fallback[session_id][-50:]
+        try:
+            key = f"session:{session_id}"
+            await self.redis.rpush(key, json.dumps([user_msg, assistant_msg]))
+            await self.redis.expire(key, self.ttl)
+        except Exception:
+            pass  # Already stored in fallback
 
     async def clear_session(self, session_id: str):
-        await self.redis.delete(f"session:{session_id}")
+        self._fallback.pop(session_id, None)
+        try:
+            await self.redis.delete(f"session:{session_id}")
+        except Exception:
+            pass
 
     async def list_sessions(self) -> List[str]:
-        keys = await self.redis.keys("session:*")
-        return [k.decode().split(":", 1)[1] if isinstance(k, bytes) else k.split(":", 1)[1] for k in keys]
+        try:
+            keys = await self.redis.keys("session:*")
+            redis_sessions = [k.decode().split(":", 1)[1] if isinstance(k, bytes) else k.split(":", 1)[1] for k in keys]
+            # Merge with fallback sessions
+            all_sessions = list(set(redis_sessions) | set(self._fallback.keys()))
+            return all_sessions
+        except Exception:
+            return list(self._fallback.keys())
 
 # ─────────────────────────── HexAI Core ───────────────────────────
 
@@ -373,6 +437,16 @@ class HexAI:
 
     async def startup(self):
         await self.model_manager.start()
+        # Check Redis connectivity – warn but don't crash if unavailable
+        try:
+            await self.redis.ping()
+            console.print("[bold green]✓ Redis połączony[/bold green]")
+        except Exception:
+            console.print(
+                "[bold yellow]⚠ Redis niedostępny (localhost:6379) – "
+                "historia sesji będzie przechowywana tylko w pamięci RAM.[/bold yellow]\n"
+                "[yellow]Uruchom Redis: docker run -d -p 6379:6379 redis:7-alpine[/yellow]"
+            )
 
     async def close(self):
         await self.model_manager.stop()
@@ -763,16 +837,7 @@ class HexAI:
 # ─────────────────────────── App Lifecycle ───────────────────────────
 
 hexai = HexAI()
-
-
-@app.on_event("startup")
-async def startup():
-    await hexai.startup()
-
-
-@app.on_event("shutdown")
-async def shutdown():
-    await hexai.close()
+_hexai_instance = hexai  # wire into lifespan
 
 
 # ─────────────────────────── Endpoints ───────────────────────────
