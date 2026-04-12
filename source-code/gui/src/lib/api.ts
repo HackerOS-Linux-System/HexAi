@@ -1,114 +1,50 @@
 import axios from 'axios';
-
-const API_BASE = 'http://localhost:8000'; // Adres backendu
-
-export interface ChatResponse {
-  session_id: string;
-  response: string;
-}
-
+const API_BASE = 'http://localhost:8000';
+export interface ChatResponse { session_id: string; response: string; }
 export interface Stats {
-  engine: string;
-  mode: string;
-  vram_used_gb: number | null;
-  vram_total_gb: number | null;
-  active_sessions: number;
-  history_len: number;
-  model_loaded: boolean;
-  model_idle_seconds: number;
+  engine: string; mode: string;
+  vram_used_gb: number | null; vram_total_gb: number | null;
+  active_sessions: number; history_len: number;
+  model_loaded: boolean; model_idle_seconds: number;
 }
-
-export interface Session {
-  session_id: string;
-}
-
 export const api = {
   async chat(sessionId: string | null, message: string): Promise<ChatResponse> {
-    const response = await axios.post<ChatResponse>(`${API_BASE}/chat`, {
-      session_id: sessionId,
-      message,
-    });
-    return response.data;
+    return (await axios.post<ChatResponse>(`${API_BASE}/chat`, { session_id: sessionId, message })).data;
   },
-
-  async streamChat(sessionId: string | null, message: string, onToken: (token: string) => void): Promise<void> {
-    const response = await fetch(`${API_BASE}/chat`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+  async streamChat(sessionId: string | null, message: string, onToken: (t: string) => void): Promise<void> {
+    const resp = await fetch(`${API_BASE}/chat`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ session_id: sessionId, message, stream: true }),
     });
-    const reader = response.body?.getReader();
+    const reader = resp.body?.getReader();
     if (!reader) return;
     const decoder = new TextDecoder();
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      const chunk = decoder.decode(value, { stream: true });
-      onToken(chunk);
+      onToken(decoder.decode(value, { stream: true }));
     }
   },
-
-  async setEngine(engine: string): Promise<void> {
-    await axios.post(`${API_BASE}/engine`, { engine });
-  },
-
-  async setMode(mode: string): Promise<void> {
-    await axios.post(`${API_BASE}/mode`, { mode });
-  },
-
+  async setEngine(engine: string): Promise<void> { await axios.post(`${API_BASE}/engine`, { engine }); },
+  async setMode(mode: string): Promise<void> { await axios.post(`${API_BASE}/mode`, { mode }); },
   async ragQuery(query: string): Promise<{ response: string }> {
-    const response = await axios.post(`${API_BASE}/rag`, { query });
-    return response.data;
+    return (await axios.post(`${API_BASE}/rag`, { query })).data;
   },
-
-  async ingestDocument(source: string, chunkSize = 500, chunkOverlap = 100): Promise<{ message: string }> {
-    const response = await axios.post(`${API_BASE}/ingest`, { source, chunk_size: chunkSize, chunk_overlap: chunkOverlap });
-    return response.data;
-  },
-
   async generateImage(prompt: string): Promise<{ image_base64: string }> {
-    const response = await axios.post(`${API_BASE}/generate_image`, { prompt });
-    return response.data;
+    return (await axios.post(`${API_BASE}/generate_image`, { prompt })).data;
   },
-
   async transcribe(file: File): Promise<{ transcription: string }> {
-    const formData = new FormData();
-    formData.append('file', file);
-    const response = await axios.post(`${API_BASE}/transcribe`, formData, {
-      headers: { 'Content-Type': 'multipart/form-data' },
-    });
-    return response.data;
+    const fd = new FormData(); fd.append('file', file);
+    return (await axios.post(`${API_BASE}/transcribe`, fd, { headers: { 'Content-Type': 'multipart/form-data' } })).data;
   },
-
   async analyzeImage(file: File, prompt: string): Promise<{ description: string }> {
-    const formData = new FormData();
-    formData.append('file', file);
-    formData.append('prompt', prompt);
-    const response = await axios.post(`${API_BASE}/analyze_image`, formData, {
-      headers: { 'Content-Type': 'multipart/form-data' },
-    });
-    return response.data;
+    const fd = new FormData(); fd.append('file', file); fd.append('prompt', prompt);
+    return (await axios.post(`${API_BASE}/analyze_image`, fd, { headers: { 'Content-Type': 'multipart/form-data' } })).data;
   },
-
   async tts(text: string): Promise<Blob> {
-    const response = await axios.get(`${API_BASE}/tts`, {
-      params: { text },
-      responseType: 'blob',
-    });
-    return response.data;
+    return (await axios.get(`${API_BASE}/tts`, { params: { text }, responseType: 'blob' })).data;
   },
-
-  async getStats(): Promise<Stats> {
-    const response = await axios.get<Stats>(`${API_BASE}/stats`);
-    return response.data;
-  },
-
-  async listSessions(): Promise<{ sessions: string[] }> {
-    const response = await axios.get(`${API_BASE}/sessions`);
-    return response.data;
-  },
-
-  async deleteSession(sessionId: string): Promise<void> {
-    await axios.delete(`${API_BASE}/session/${sessionId}`);
-  },
+  async getStats(): Promise<Stats> { return (await axios.get<Stats>(`${API_BASE}/stats`)).data; },
+  async listSessions(): Promise<{ sessions: string[] }> { return (await axios.get(`${API_BASE}/sessions`)).data; },
+  async deleteSession(sessionId: string): Promise<void> { await axios.delete(`${API_BASE}/session/${sessionId}`); },
 };
