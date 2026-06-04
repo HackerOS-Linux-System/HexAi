@@ -1,7 +1,7 @@
 {
   "productName": "HexAi",
-  "version": "1.0.0",
-  "identifier": "com.hexai.desktop",
+  "version": "2.0.0",
+  "identifier": "dev.hexai.app",
   "build": {
     "beforeDevCommand": "npm run dev",
     "beforeBuildCommand": "npm run build",
@@ -12,30 +12,21 @@
     "windows": [
       {
         "title": "HexAi",
-        "width": 1280,
-        "height": 840,
+        "width": 1200,
+        "height": 800,
+        "minWidth": 800,
+        "minHeight": 600,
         "resizable": true,
-        "fullscreen": false,
-        "decorations": true
+        "fullscreen": false
       }
     ],
     "security": {
-      "csp": "default-src 'self'; font-src 'self' https://fonts.gstatic.com data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; script-src 'self' 'unsafe-inline'; img-src 'self' data: https: http: blob:; connect-src http://localhost:8000 http://localhost:3000 ws://localhost:3000"
+      "csp": null
     }
   },
   "bundle": {
     "active": true,
-    "icon": [
-      "icons/icon.png"
-    ],
     "targets": "all",
-    "category": "DeveloperTool",
-    "shortDescription": "HexAi – inteligentny asystent AI",
-    "longDescription": "Lokalny asystent AI dla HackerOS z obsługą czatu, RAG i multimediów."
-  },
-  "plugins": {
-    "shell": {
-      "open": true
-    }
+    "icon": []
   }
 }
