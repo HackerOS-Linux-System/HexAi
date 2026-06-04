@@ -1,0 +1,51 @@
+[package]
+name    = "hexai-backend"
+version = "2.0.0"
+edition = "2021"
+
+[lib]
+name = "hexai_backend"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hexai-server"
+path = "src/main.rs"
+
+[dependencies]
+tokio            = { workspace = true }
+serde            = { workspace = true }
+serde_json       = { workspace = true }
+anyhow           = { workspace = true }
+thiserror        = { workspace = true }
+tracing          = { workspace = true }
+tracing-subscriber = { workspace = true }
+reqwest          = { workspace = true }
+axum             = { workspace = true }
+tower-http       = { workspace = true }
+uuid             = { workspace = true }
+chrono           = { workspace = true }
+bytes            = { workspace = true }
+futures          = { workspace = true }
+async-stream     = { workspace = true }
+
+# Storage
+redis            = { version = "0.25", features = ["tokio-comp", "connection-manager"] }
+
+# ML / embedding via candle (CPU-friendly, no Python dep)
+# For heavy GPU work the server delegates to ollama or transformers via HTTP
+ollama-rs        = { version = "0.2", features = ["stream"] }
+
+# Web scraping / PDF
+scraper          = "0.20"
+pdf-extract      = "0.7"
+
+# Search
+duckduckgo-search = "0.1"
+
+# Misc
+regex            = "1"
+base64           = "0.22"
+rand             = "1"
+dashmap          = "6"
+once_cell        = "1"
+tokio-stream     = "0.1"
