@@ -2,7 +2,7 @@
 resolver = "2"
 members = [
     "backend",
-    "sourc-code/tui",
+    "source-code/tui",
     "source-code/gui",
 ]
 
