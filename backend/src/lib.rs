@@ -1,9 +1,11 @@
+pub mod auth;
 pub mod config;
+pub mod engine;
 pub mod error;
 pub mod memory;
-pub mod rag;
 pub mod profiler;
-pub mod engine;
-pub mod tools;
+pub mod rag;
 pub mod router;
 pub mod state;
+pub mod tools;
+pub mod static_gui;
