@@ -1,0 +1,38 @@
+[package]
+name    = "hexai"
+version = "2.0.0"
+edition = "2021"
+
+[[bin]]
+name = "hexai"
+path = "src/main.rs"
+
+[dependencies]
+hexai-backend = { path = "../backend" }
+hexai-tui     = { path = "../tui" }
+
+tokio              = { workspace = true }
+anyhow             = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+ratatui   = "0.27"
+crossterm = { version = "0.27", features = ["event-stream"] }
+redis     = { version = "0.25", features = ["tokio-comp", "connection-manager"] }
+axum      = { workspace = true }
+
+# Native WebView – same engine Tauri uses internally
+# wry 0.40 uses tao 0.28 as event loop backend
+wry = "0.40"
+tao = "0.28"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# On Linux wry needs gtk via pkg-config – these are system deps, not Cargo deps.
+# Make sure you have: apt install libwebkit2gtk-4.1-dev libgtk-3-dev
+# (no extra Cargo deps needed, wry handles it via pkg-config)
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# Windows uses WebView2 which ships with Edge – no extra deps
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# macOS uses WKWebView – built into the OS, no extra deps
