@@ -1,9 +1,9 @@
-use anyhow::Result;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 pub const API_BASE: &str = "http://localhost:8000";
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct Stats {
     pub engine: String,
     pub mode: String,
@@ -14,12 +14,12 @@ pub struct Stats {
     pub model_idle_seconds: f64,
 }
 
-pub async fn fetch_stats() -> Result<Stats> {
+pub async fn fetch_stats() -> anyhow::Result<Stats> {
     let s = reqwest::get(format!("{API_BASE}/stats")).await?.json().await?;
     Ok(s)
 }
 
-pub async fn set_engine(engine: &str) -> Result<()> {
+pub async fn set_engine(engine: &str) -> anyhow::Result<()> {
     reqwest::Client::new()
         .post(format!("{API_BASE}/engine"))
         .json(&serde_json::json!({"engine": engine}))
@@ -27,7 +27,7 @@ pub async fn set_engine(engine: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn set_mode(mode: &str) -> Result<()> {
+pub async fn set_mode(mode: &str) -> anyhow::Result<()> {
     reqwest::Client::new()
         .post(format!("{API_BASE}/mode"))
         .json(&serde_json::json!({"mode": mode}))
@@ -35,7 +35,6 @@ pub async fn set_mode(mode: &str) -> Result<()> {
     Ok(())
 }
 
-/// Returns an async iterator of token strings via a streaming HTTP response.
 pub async fn stream_chat(
     session_id: Option<&str>,
     message: &str,
@@ -55,10 +54,7 @@ pub async fn stream_chat(
         .await
     {
         Ok(r) => r,
-        Err(e) => {
-            let _ = tx.send(StreamEvent::Error(e.to_string())).await;
-            return;
-        }
+        Err(e) => { let _ = tx.send(StreamEvent::Error(e.to_string())).await; return; }
     };
 
     use futures::StreamExt;
@@ -70,10 +66,7 @@ pub async fn stream_chat(
                     let _ = tx.send(StreamEvent::Token(s.to_string())).await;
                 }
             }
-            Err(e) => {
-                let _ = tx.send(StreamEvent::Error(e.to_string())).await;
-                return;
-            }
+            Err(e) => { let _ = tx.send(StreamEvent::Error(e.to_string())).await; return; }
         }
     }
     let _ = tx.send(StreamEvent::Done).await;
