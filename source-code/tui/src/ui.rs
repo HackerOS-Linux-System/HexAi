@@ -3,11 +3,10 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Frame,
 };
 
-// ── Colour palette ────────────────────────────────────────────────
 const ACCENT:     Color = Color::Rgb(217, 119, 6);
 const ACCENT_DIM: Color = Color::Rgb(146, 64, 14);
 const TEXT_PRI:   Color = Color::Rgb(245, 240, 232);
@@ -19,25 +18,14 @@ const BG_ELEV:    Color = Color::Rgb(42, 40, 37);
 const C_GREEN:    Color = Color::Rgb(74, 222, 128);
 const C_RED:      Color = Color::Rgb(248, 113, 113);
 
-// ── Main draw ────────────────────────────────────────────────────
-
 pub fn draw(f: &mut Frame, app: &mut App) {
-    let size = f.area();
-
-    // background
+    let size = f.size();
     f.render_widget(Block::default().style(Style::default().bg(Color::Rgb(26, 25, 22))), size);
-
+    draw_chat_bg(f, app, size);
     match app.screen {
-        Screen::Help     => draw_chat_bg(f, app, size), // draw chat behind overlay
-        Screen::Settings => draw_chat_bg(f, app, size),
-        Screen::Chat     => { draw_chat_bg(f, app, size); return; }
-    }
-
-    // Overlay on top
-    match app.screen {
-        Screen::Help     => draw_help_overlay(f, app, size),
+        Screen::Help     => draw_help_overlay(f, size),
         Screen::Settings => draw_settings_overlay(f, app, size),
-        _ => {}
+        Screen::Chat     => {}
     }
 }
 
@@ -45,11 +33,11 @@ fn draw_chat_bg(f: &mut Frame, app: &mut App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),   // header
-            Constraint::Length(1),   // divider
-            Constraint::Min(4),      // viewport
-            Constraint::Length(5),   // input box
-            Constraint::Length(1),   // status bar
+            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Min(4),
+            Constraint::Length(5),
+            Constraint::Length(1),
         ])
         .split(area);
 
@@ -60,14 +48,13 @@ fn draw_chat_bg(f: &mut Frame, app: &mut App, area: Rect) {
     render_statusbar(f, app, chunks[4]);
 }
 
-// ── Header ────────────────────────────────────────────────────────
-
 fn render_header(f: &mut Frame, app: &App, area: Rect) {
     let engine_str = if app.engine == "ollama" { "CPU" } else { "GPU" };
     let mode_str   = if app.mode == "programista" { "Dev" } else { "Ogólny" };
-    let model_str  = if app.stats.as_ref().map(|s| s.model_loaded).unwrap_or(false) { "● model" } else { "○ offline" };
+    let model_loaded = app.stats.as_ref().map(|s| s.model_loaded).unwrap_or(false);
+    let model_str  = if model_loaded { "● model" } else { "○ offline" };
 
-    let left  = Line::from(vec![
+    let left = Line::from(vec![
         Span::styled("⬡ HexAi", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
         Span::styled("  v2.0.0", Style::default().fg(TEXT_MUTED)),
     ]);
@@ -76,26 +63,19 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         Span::raw("  "),
         Span::styled(mode_str, Style::default().fg(TEXT_SEC)),
         Span::raw("  "),
-        Span::styled(model_str, Style::default().fg(if app.stats.as_ref().map(|s| s.model_loaded).unwrap_or(false) { C_GREEN } else { TEXT_MUTED })),
+        Span::styled(model_str, Style::default().fg(if model_loaded { C_GREEN } else { TEXT_MUTED })),
     ]);
 
     let block = Block::default().style(Style::default().bg(BG_SURF));
     f.render_widget(block, area);
-
-    let left_p  = Paragraph::new(left).block(Block::default().style(Style::default().bg(BG_SURF)));
-    let right_p = Paragraph::new(right)
-        .alignment(Alignment::Right)
-        .block(Block::default().style(Style::default().bg(BG_SURF)));
-    f.render_widget(left_p,  area);
-    f.render_widget(right_p, area);
+    f.render_widget(Paragraph::new(left).style(Style::default().bg(BG_SURF)), area);
+    f.render_widget(Paragraph::new(right).alignment(Alignment::Right).style(Style::default().bg(BG_SURF)), area);
 }
 
 fn render_divider(f: &mut Frame, area: Rect) {
     let line = "─".repeat(area.width as usize);
     f.render_widget(Paragraph::new(line).style(Style::default().fg(Color::Rgb(45, 43, 40))), area);
 }
-
-// ── Messages ──────────────────────────────────────────────────────
 
 fn render_messages(f: &mut Frame, app: &mut App, area: Rect) {
     if app.messages.is_empty() {
@@ -124,10 +104,7 @@ fn render_messages(f: &mut Frame, app: &mut App, area: Rect) {
                     Span::styled(format!("  {ts}"), Style::default().fg(TEXT_MUTED)),
                 ]));
                 for line in textwrap::wrap(&msg.content, wrap_width) {
-                    lines.push(Line::from(Span::styled(
-                        format!("  {line}"),
-                        Style::default().fg(Color::Rgb(254, 243, 199)),
-                    )));
+                    lines.push(Line::from(Span::styled(format!("  {line}"), Style::default().fg(Color::Rgb(254, 243, 199)))));
                 }
             }
             Role::Assistant => {
@@ -143,16 +120,10 @@ fn render_messages(f: &mut Frame, app: &mut App, area: Rect) {
         lines.push(Line::from(""));
     }
 
-    if app.loading && app.stream_buf.is_empty() {
-        lines.push(Line::from(Span::styled("  HexAi", Style::default().fg(TEXT_AMB).add_modifier(Modifier::BOLD))));
-        lines.push(Line::from(Span::styled("  ⣾ myślę…", Style::default().fg(ACCENT))));
-        lines.push(Line::from(""));
-    }
+
 
     let total_lines = lines.len() as u16;
     let visible = area.height;
-
-    // Clamp scroll
     let max_scroll = total_lines.saturating_sub(visible);
     if app.scroll_offset == u16::MAX {
         app.scroll_offset = max_scroll;
@@ -160,13 +131,10 @@ fn render_messages(f: &mut Frame, app: &mut App, area: Rect) {
         app.scroll_offset = app.scroll_offset.min(max_scroll);
     }
 
-    let p = Paragraph::new(Text::from(lines))
-        .scroll((app.scroll_offset, 0));
-    f.render_widget(p, area);
+    f.render_widget(Paragraph::new(Text::from(lines)).scroll((app.scroll_offset, 0)), area);
 }
 
 fn render_ai_line<'a>(line: &str) -> Line<'a> {
-    // Highlight `code` spans
     let mut spans = vec![Span::raw("  ")];
     let mut rest = line.to_string();
     while let Some(start) = rest.find('`') {
@@ -190,27 +158,25 @@ fn render_ai_line<'a>(line: &str) -> Line<'a> {
     Line::from(spans)
 }
 
-// ── Input ─────────────────────────────────────────────────────────
-
 fn render_input(f: &mut Frame, app: &App, area: Rect) {
-    let spinner_frames = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
-    let spin_idx = (chrono::Local::now().timestamp_millis() / 120) as usize % spinner_frames.len();
+    let spin_frames = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
+    let spin_idx = (chrono::Local::now().timestamp_millis() / 120) as usize % spin_frames.len();
     let hint = if app.loading {
-        format!(" {} Generowanie…", spinner_frames[spin_idx])
+        format!(" {} Generowanie…", spin_frames[spin_idx])
     } else {
         " Enter wyślij · Shift+Enter nowa linia · Ctrl+N nowa · ? pomoc".into()
     };
 
-    // Show cursor in input
-    let before_cursor = &app.input[..app.input_cursor];
-    let after_cursor  = &app.input[app.input_cursor..];
-    let cursor_char   = if after_cursor.is_empty() { " " } else { &after_cursor[..after_cursor.chars().next().map(|c| c.len_utf8()).unwrap_or(1)] };
-    let after_cursor_rest = if after_cursor.len() > cursor_char.len() { &after_cursor[cursor_char.len()..] } else { "" };
+    let before = &app.input[..app.input_cursor];
+    let after  = &app.input[app.input_cursor..];
+    let cur_len = after.chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+    let cursor_char = if after.is_empty() { " " } else { &after[..cur_len] };
+    let after_rest  = if after.len() > cur_len { &after[cur_len..] } else { "" };
 
     let input_line = Line::from(vec![
-        Span::styled(before_cursor, Style::default().fg(TEXT_PRI)),
+        Span::styled(before, Style::default().fg(TEXT_PRI)),
         Span::styled(cursor_char, Style::default().fg(Color::Black).bg(ACCENT)),
-        Span::styled(after_cursor_rest, Style::default().fg(TEXT_PRI)),
+        Span::styled(after_rest, Style::default().fg(TEXT_PRI)),
     ]);
 
     let text = Text::from(vec![
@@ -225,8 +191,6 @@ fn render_input(f: &mut Frame, app: &App, area: Rect) {
 
     f.render_widget(Paragraph::new(text).block(block).wrap(Wrap { trim: false }), area);
 }
-
-// ── Status bar ────────────────────────────────────────────────────
 
 fn render_statusbar(f: &mut Frame, app: &App, area: Rect) {
     let keys = [("Ctrl+N", "Nowa"), ("Ctrl+S", "Ustawienia"), ("?", "Pomoc"), ("Ctrl+C", "Wyjście")];
@@ -249,13 +213,8 @@ fn render_statusbar(f: &mut Frame, app: &App, area: Rect) {
         }
     }
 
-    f.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().bg(BG_SURF)),
-        area,
-    );
+    f.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().bg(BG_SURF)), area);
 }
-
-// ── Settings overlay ──────────────────────────────────────────────
 
 fn draw_settings_overlay(f: &mut Frame, app: &App, area: Rect) {
     let modal_w = 44u16;
@@ -263,7 +222,6 @@ fn draw_settings_overlay(f: &mut Frame, app: &App, area: Rect) {
     let x = area.width.saturating_sub(modal_w) / 2;
     let y = area.height.saturating_sub(modal_h) / 2;
     let modal_area = Rect::new(x, y, modal_w.min(area.width), modal_h.min(area.height));
-
     f.render_widget(Clear, modal_area);
 
     let block = Block::default()
@@ -273,7 +231,7 @@ fn draw_settings_overlay(f: &mut Frame, app: &App, area: Rect) {
         .border_style(Style::default().fg(ACCENT_DIM))
         .style(Style::default().bg(BG_SURF));
 
-    let items: Vec<(&str, &str, &str, usize)> = vec![
+    let items: &[(&str, &str, &str, usize)] = &[
         ("SILNIK", "transformers", "⚡ Transformers (GPU)", 0),
         ("SILNIK", "ollama",       "🖥  Ollama (CPU)",      1),
         ("TRYB",   "general",      "💬 Ogólny",             2),
@@ -282,16 +240,15 @@ fn draw_settings_overlay(f: &mut Frame, app: &App, area: Rect) {
 
     let mut lines: Vec<Line> = vec![Line::from("")];
     let mut prev_group = "";
-    for (group, val, label, idx) in &items {
+    for (group, val, label, idx) in items {
         if *group != prev_group {
             lines.push(Line::from(Span::styled(*group, Style::default().fg(TEXT_MUTED))));
             prev_group = group;
         }
-        let is_current = ((*group == "SILNIK") && (*val == app.engine))
-            || ((*group == "TRYB") && (*val == app.mode));
+        let is_current = (*group == "SILNIK" && *val == app.engine)
+            || (*group == "TRYB" && *val == app.mode);
         let is_cursor = app.settings_cursor == *idx;
         let prefix = if is_current { "  ● " } else { "  ○ " };
-
         let style = if is_current {
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
         } else if is_cursor {
@@ -302,7 +259,6 @@ fn draw_settings_overlay(f: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::from(Span::styled(format!("{prefix}{label}"), style)));
     }
 
-    // VRAM bar
     if let Some(s) = &app.stats {
         if let (Some(used), Some(total)) = (s.vram_used_gb, s.vram_total_gb) {
             let pct = (used / total * 100.0) as u16;
@@ -311,26 +267,19 @@ fn draw_settings_overlay(f: &mut Frame, app: &App, area: Rect) {
             let bar_len = 20usize;
             let filled = (pct as usize * bar_len / 100).min(bar_len);
             let color = if pct > 80 { C_RED } else if pct > 60 { ACCENT } else { C_GREEN };
-            let bar = format!("  {}{}", "█".repeat(filled), "░".repeat(bar_len - filled));
             lines.push(Line::from(vec![
-                Span::styled(bar, Style::default().fg(color)),
+                Span::styled(format!("  {}{}", "█".repeat(filled), "░".repeat(bar_len - filled)), Style::default().fg(color)),
                 Span::styled(format!(" {pct}% ({used:.1}/{total:.1}GB)"), Style::default().fg(TEXT_MUTED)),
             ]));
         }
     }
 
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "  ↑↓/jk Nawiguj · Enter Wybierz · Esc Zamknij",
-        Style::default().fg(TEXT_MUTED),
-    )));
-
+    lines.push(Line::from(Span::styled("  ↑↓/jk Nawiguj · Enter Wybierz · Esc Zamknij", Style::default().fg(TEXT_MUTED))));
     f.render_widget(Paragraph::new(Text::from(lines)).block(block), modal_area);
 }
 
-// ── Help overlay ──────────────────────────────────────────────────
-
-fn draw_help_overlay(f: &mut Frame, _app: &App, area: Rect) {
+fn draw_help_overlay(f: &mut Frame, area: Rect) {
     let modal_w = 50u16;
     let modal_h = 16u16;
     let x = area.width.saturating_sub(modal_w) / 2;
@@ -367,6 +316,5 @@ fn draw_help_overlay(f: &mut Frame, _app: &App, area: Rect) {
     lines.push(Line::from(Span::styled("  HexAi for HackerOS · GPL-3.0", Style::default().fg(TEXT_MUTED))));
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled("  Naciśnij dowolny klawisz aby zamknąć", Style::default().fg(TEXT_MUTED))));
-
     f.render_widget(Paragraph::new(Text::from(lines)).block(block), modal_area);
 }
