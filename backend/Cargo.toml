@@ -30,7 +30,7 @@ redis        = { version = "0.25", features = ["tokio-comp", "connection-manager
 dashmap      = "5"
 once_cell    = "1"
 
-# RAG
+# RAG / embeddings
 urlencoding  = "2"
 
 # Web / PDF
@@ -51,6 +51,17 @@ nonzero_ext  = "0.3"
 # SQLite
 rusqlite     = { version = "0.31", features = ["bundled", "serde_json"] }
 
-# Static file embedding for GUI
+# GUI static embedding
 include_dir  = "0.7"
 mime_guess   = "2"
+
+# ── Local LLM inference via llama.cpp ─────────────────────────────
+# Requires: cmake, C++ compiler, optionally CUDA toolkit
+# On Linux: apt install cmake build-essential libclblast-dev
+# With CUDA: enable feature "cuda"
+llama_cpp = { version = "0.3", features = [] }
+
+[features]
+default = []
+cuda    = ["llama_cpp/cuda"]   # NVIDIA GPU
+metal   = ["llama_cpp/metal"]    # macOS GPU (Apple Silicon)
