@@ -17,6 +17,8 @@ pub struct Config {
     pub rate_limit_rpm: u32,
     // CORS – comma-separated allowed origins, "*" = any
     pub cors_origins: Vec<String>,
+    // Local llama.cpp model (used when HEXAI_ENGINE=local)
+    pub model_path: Option<String>,
 }
 
 impl Default for Config {
@@ -36,6 +38,7 @@ impl Default for Config {
             auth_enabled:       env::var("HEXAI_AUTH").map(|v| v == "1" || v == "true").unwrap_or(false),
             rate_limit_rpm:     env::var("HEXAI_RATE_LIMIT_RPM").ok().and_then(|v| v.parse().ok()).unwrap_or(60),
             cors_origins,
+            model_path: std::env::var("HEXAI_MODEL_PATH").ok(),
         }
     }
 }
