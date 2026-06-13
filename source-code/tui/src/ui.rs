@@ -56,7 +56,7 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
 
     let left = Line::from(vec![
         Span::styled("⬡ HexAi", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
-        Span::styled("  v2.0.0", Style::default().fg(TEXT_MUTED)),
+        Span::styled("  v0.0.1", Style::default().fg(TEXT_MUTED)),
     ]);
     let right = Line::from(vec![
         Span::styled(format!(" {engine_str} "), Style::default().fg(ACCENT).bg(Color::Rgb(45, 21, 0)).add_modifier(Modifier::BOLD)),
@@ -232,10 +232,11 @@ fn draw_settings_overlay(f: &mut Frame, app: &App, area: Rect) {
         .style(Style::default().bg(BG_SURF));
 
     let items: &[(&str, &str, &str, usize)] = &[
-        ("SILNIK", "transformers", "⚡ Transformers (GPU)", 0),
-        ("SILNIK", "ollama",       "🖥  Ollama (CPU)",      1),
-        ("TRYB",   "general",      "💬 Ogólny",             2),
-        ("TRYB",   "programista",  "💻 Programista (Dev)",  3),
+        ("SILNIK", "local",        "🧠 llama.cpp (wbudowany)", 0),
+        ("SILNIK", "ollama",       "🦙 Ollama (daemon)",       1),
+        ("SILNIK", "openai",       "🌐 OpenAI / LM Studio",   2),
+        ("TRYB",   "general",      "💬 Ogólny",               3),
+        ("TRYB",   "programista",  "💻 Programista (Dev)",    4),
     ];
 
     let mut lines: Vec<Line> = vec![Line::from("")];
